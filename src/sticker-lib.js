@@ -59,6 +59,9 @@ export function normalizeStickerEntry(raw) {
     resId: String(entry.resId || entry.emoji_id || id).trim(),
     url: String(entry.url || '').trim(),
     md5: String(entry.md5 || '').trim().toUpperCase(),
+    // NapCat 的 set_custom_face_desc 要数字 emoId 和 md5 原值（大小写不动），只有 NapCat 返回里才有
+    ...(Number.isFinite(Number(entry.emoId)) && entry.emoId !== '' && entry.emoId !== null && entry.emoId !== undefined ? { emoId: Number(entry.emoId) } : {}),
+    ...(entry.rawMd5 ? { rawMd5: String(entry.rawMd5).trim() } : {}),
     desc: sanitizeStickerText(entry.desc, 200),
     localNote: sanitizeStickerText(entry.localNote, 200),
     tags,
@@ -117,7 +120,7 @@ export function saveStickerStore(file, entries) {
   }
 }
 
-// 把 SnowLuma 返回的 QQ 收藏表情详情合并进本地库。
+// 把网关（SnowLuma / NapCat）返回的 QQ 收藏表情详情合并进本地库。
 // 保留本地 AI 认知字段（localNote/tags/usage/useCount/lastUsedAt/lastContext），
 // 只更新 QQ 侧字段（id/resId/url/md5/desc）。
 export function mergeStickerLibrary(existing, fetched, { complete = true } = {}) {
@@ -139,6 +142,8 @@ export function mergeStickerLibrary(existing, fetched, { complete = true } = {})
       resId: String(item.resId || item.emoji_id || id).trim(),
       url: String(item.url || old?.url || '').trim(),
       md5: String(item.md5 || old?.md5 || '').trim().toUpperCase(),
+      emoId: item.emoId ?? old?.emoId,
+      rawMd5: String(item.md5 || old?.rawMd5 || '').trim(),
       desc: String(item.desc ?? old?.desc ?? '').trim(),
       localNote: old?.localNote || '',
       tags: old?.tags || [],

@@ -25,6 +25,7 @@ import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
+import { resolveImplSetting, detectImplFromVersion, buildFaceRemarkRequest, sniffImageExt } from './onebot-impl.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -1065,6 +1066,11 @@ function consolePortInUse() {
       const out = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
       return new RegExp(`[:.]${port}\\s+\\S+\\s+LISTENING`, 'i').test(out);
     }
+    if (process.platform === 'darwin') {
+      // macOS 的 BSD netstat 没有 -l，`netstat -ltn` 会列出全部连接（含远端端口），只能自己筛 LISTEN 行。
+      const out = execFileSync('netstat', ['-an', '-p', 'tcp'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+      return new RegExp(`[:.]${port}\\s+\\S+\\s+LISTEN\\b`).test(out);
+    }
     const out = execFileSync('sh', ['-c', 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
     return new RegExp(`[:.]${port}\\s`).test(out);
   } catch {
@@ -1430,6 +1436,31 @@ async function main() {
   function saveStickerStoreSafe() {
     if (!stickerStoreWritable) return; // 读失败时绝不回写，避免把「损坏」当成「空库」落盘
     try { saveStickerStore(STICKER_FILE, stickerEntries); } catch (error) { log('保存表情库失败:', error?.message ?? error); }
+  }
+
+  // 网关实现（SnowLuma / NapCat）：收藏表情的几个扩展接口两边不一样，见 onebot-impl.js。
+  // snowluma.impl 显式指定时不探测；否则问一次 get_version_info 并缓存。探测抛错不缓存，下次再试。
+  let oneBotImpl = null;
+  async function getOneBotImpl() {
+    const forced = resolveImplSetting(cfg.snowluma?.impl);
+    if (forced !== 'auto') return forced;
+    if (oneBotImpl) return oneBotImpl;
+    try {
+      const res = await bot.request('get_version_info', {});
+      oneBotImpl = res?.status === 'ok' ? detectImplFromVersion(res.data) : 'unknown';
+      log(`[onebot] 网关实现：${oneBotImpl}（${res?.data?.app_name ?? '未知'} ${res?.data?.app_version ?? ''}）`);
+    } catch (error) {
+      log(`[onebot] get_version_info 失败，按 SnowLuma 处理：${error?.message ?? error}`);
+      return 'unknown';
+    }
+    return oneBotImpl;
+  }
+
+  // 改 QQ 收藏表情备注：SnowLuma 用 modify_custom_face，NapCat 用 set_custom_face_desc。
+  async function requestFaceRemark(entry, desc) {
+    const { action, params } = buildFaceRemarkRequest(await getOneBotImpl(), entry, desc);
+    const response = await bot.request(action, params);
+    return { action, response };
   }
 
   // 从 SnowLuma OneBot 拉取 QQ 账号收藏表情（fetch_custom_face_detail），并合并进本地库。
@@ -1957,15 +1988,15 @@ async function main() {
     return updated.entry;
   }
 
-  // 修改 QQ 账号里的收藏表情备注（modify_custom_face），并同步本地 desc。
+  // 修改 QQ 账号里的收藏表情备注（SnowLuma: modify_custom_face / NapCat: set_custom_face_desc），并同步本地 desc。
   async function setStickerRemarkV2(stickerId, remark) {
     const synced = await syncStickerLibrary(false);
     const entry = findSticker(synced?.entries ?? stickerEntries, stickerId);
     if (!entry) throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
     const cleanRemark = String(remark ?? '').trim().slice(0, 50);
-    const response = await bot.request('modify_custom_face', { emoji_id: entry.id, desc: cleanRemark });
+    const { action, response } = await requestFaceRemark(entry, cleanRemark);
     if (!response || response.status !== 'ok' || response.retcode !== 0) {
-      throw new Error(`modify_custom_face 失败: ${response?.wording || response?.retcode || 'unknown'}`);
+      throw new Error(`${action} 失败: ${response?.wording || response?.retcode || 'unknown'}`);
     }
     const updated = applyStickerNote(stickerEntries, entry.id, {});
     // 直接改 desc（保留本地认知）
@@ -1978,7 +2009,7 @@ async function main() {
     return stickerEntries.find((e) => e.id === entry.id) || null;
   }
 
-  // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（modify_custom_face）。
+  // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（见 requestFaceRemark）。
   async function collectStickerV2(key, messageRef, remark) {
     const assertSendAllowed = captureSendGuard(key);
     const st = getSocialV2State(key);
@@ -1989,39 +2020,78 @@ async function main() {
     if (!mediaList.length) throw new Error('这条消息没有可收藏的图片/表情');
     const media = mediaList[0];
     let file = '';
+    let faceBuffer = null;
     if (media?.kind === 'image') {
       // 优先取图片字节转 base64，避免 SnowLuma 直接下载聊天图片 URL 失败（带签名/防盗链）。
       // 严禁把消息里的原始 media.url / media.file 直接交给 OneBot 去下载：那会绕过 SSRF/本地文件防护。
       const img = await fetchOneBotImage(media);
       if (img?.buffer) {
+        faceBuffer = img.buffer;
         file = 'base64://' + img.buffer.toString('base64');
       } else {
         throw new Error('无法安全获取该图片字节，已拒绝收藏');
       }
     } else if (media?.kind === 'face') {
       const face = await fetchFaceMedia(media);
-      if (face?.buffer) file = 'base64://' + face.buffer.toString('base64');
+      if (face?.buffer) {
+        faceBuffer = face.buffer;
+        file = 'base64://' + face.buffer.toString('base64');
+      }
     }
-    if (!file) throw new Error('无法获取该表情的图片源');
+    if (!file || !faceBuffer) throw new Error('无法获取该表情的图片源');
+    const impl = await getOneBotImpl();
+    const md5 = crypto.createHash('md5').update(faceBuffer).digest('hex').toUpperCase();
     assertSendAllowed();
-    const addRes = await bot.request('add_custom_face', { file });
-    if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
-      throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
+    let emojiId = '';
+    if (impl === 'napcat') {
+      // NapCat 的 add_custom_face 只认本地路径（直接 stat/readFile，不解析 base64://），也不回 emoji_id。
+      // 字节是桥接自己取到并校验过的，落到私有临时目录再交给它；NapCat 与桥接需在同一台机器上。
+      const tmpDir = path.join(os.tmpdir(), 'qq-bridge-faces');
+      fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
+      const tmpFile = path.join(tmpDir, `${md5}.${sniffImageExt(faceBuffer)}`);
+      fs.writeFileSync(tmpFile, faceBuffer, { mode: 0o600 });
+      try {
+        const addRes = await bot.request('add_custom_face', { file: tmpFile });
+        if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
+          throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
+        }
+      } finally {
+        try { fs.unlinkSync(tmpFile); } catch {}
+      }
+    } else {
+      const addRes = await bot.request('add_custom_face', { file });
+      if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
+        throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
+      }
+      emojiId = String(addRes.data?.emoji_id || '');
+      if (!emojiId) throw new Error('add_custom_face 未返回 emoji_id');
     }
-    const emojiId = String(addRes.data?.emoji_id || '');
-    if (!emojiId) throw new Error('add_custom_face 未返回 emoji_id');
+    // 强制刷新本地库，让刚收藏的表情立即可用；NapCat 没回 id，按 md5 在库里认回来。
+    let synced = await syncStickerLibrary(true);
+    let entry = findSticker(synced?.entries ?? stickerEntries, emojiId || md5);
+    if (!emojiId) emojiId = entry?.id || '';
     const maxRemarkChars = Math.max(1, Number(cfg.socialV2?.sticker?.collect?.maxRemarkChars) || 20);
     const cleanRemark = String(remark ?? '').trim().slice(0, maxRemarkChars);
     if (cleanRemark) {
-      assertSendAllowed();
-      const modRes = await bot.request('modify_custom_face', { emoji_id: emojiId, desc: cleanRemark });
-      if (!modRes || modRes.status !== 'ok' || modRes.retcode !== 0) {
-        log(`[sticker] 收藏成功但备注失败 ${emojiId}: ${modRes?.wording || modRes?.retcode || 'unknown'}`);
+      // SnowLuma 只要 emoji_id，库没同步上也能写；NapCat 必须拿到库里那条（emoId/resId/md5）。
+      const remarkTarget = entry || (impl !== 'napcat' && emojiId ? { id: emojiId } : null);
+      if (!remarkTarget) {
+        log(`[sticker] 收藏成功但在表情库里没找到它（md5 ${md5}），备注没写上`);
+      } else {
+        assertSendAllowed();
+        try {
+          const { action, response } = await requestFaceRemark(remarkTarget, cleanRemark);
+          if (!response || response.status !== 'ok' || response.retcode !== 0) {
+            log(`[sticker] 收藏成功但备注失败 ${emojiId}（${action}）: ${response?.wording || response?.retcode || 'unknown'}`);
+          } else {
+            synced = await syncStickerLibrary(true);
+            entry = findSticker(synced?.entries ?? stickerEntries, emojiId) || entry;
+          }
+        } catch (error) {
+          log(`[sticker] 收藏成功但备注失败 ${emojiId}: ${error?.message ?? error}`);
+        }
       }
     }
-    // 强制刷新本地库，让刚收藏的表情立即可用。
-    const synced = await syncStickerLibrary(true);
-    const entry = findSticker(synced?.entries ?? stickerEntries, emojiId);
     return { emojiId, entry: entry || null, remark: cleanRemark };
   }
 
