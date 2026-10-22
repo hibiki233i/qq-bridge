@@ -26,6 +26,7 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { resolveImplSetting, detectImplFromVersion, buildFaceRemarkRequest, sniffImageExt } from './onebot-impl.js';
+import { TelegramClient, normalizeTelegramConfig, telegramConfigProblems, tgChatIdOf, isTelegramConvId, tgConvId, updateToEvent, createTelegramMessageCache, startTelegramPolling } from './telegram.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -676,6 +677,7 @@ function loadConfig() {
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
+    telegram: normalizeTelegramConfig(file.telegram),
     allow: {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
@@ -1220,6 +1222,7 @@ function log(...args) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
+const TELEGRAM_UNSUPPORTED = 'Telegram 会话不支持这个操作（拍一拍、语音、QQ 表情包、合并转发只有 QQ 有）';
 const SEND_TIMEOUT_MS = 15000;
 // DSH 控制类调用（停任务/归档会话）的超时。这些 await 以前是裸的：DSH 接受了连接但
 // 不返回响应时，HTTP handler 永不返回，控制台与群消息一起失去响应（issue #32）。
@@ -1358,6 +1361,16 @@ function extractMediaFromSegments(segments) {
 }
 
 function allowed(kind, id, cfg) {
+  // Telegram 会话（tg<chat_id>）走 telegram 段自己的名单：群 id 是负数，和 QQ 名单格式不同；
+  // 名单为空就谁也不理（不跟随 allowAllWhenEmpty）。管理员自己的私聊总是放行。
+  const tgChat = tgChatIdOf(id);
+  if (tgChat !== null) {
+    const t = cfg.telegram;
+    if (!t?.enabled) return false;
+    if (kind === 'private' && t.ownerId && tgChat === t.ownerId) return true;
+    const list = kind === 'private' ? t.allow?.private : t.allow?.groups;
+    return Array.isArray(list) && list.includes(tgChat);
+  }
   // OneBot 事件里的 id 可能是数字也可能是字符串（int64 序列化差异），统一转字符串比较。
   // 配置字段兼容单数（group/private）与复数（groups/privates）两种写法。
   const s = String(id);
@@ -1368,13 +1381,29 @@ function allowed(kind, id, cfg) {
   return cfg.allowAllWhenEmpty;
 }
 
-// 二代会话 key 规范化：只接受 group:正整数 / private:正整数，并去掉前导零，避免同一会话出现多个别名。
-function canonicalV2Key(key) {
-  const m = /^(group|private):(\d+)$/.exec(String(key ?? '').trim());
+/**
+ * 解析会话 key：`group:群号` / `private:QQ号`，或 Telegram 的 `group:tg-100…` / `private:tg123…`。
+ * 返回 { kind, id, telegram }：QQ 的 id 是数字，Telegram 的 id 保持 `tg<chat_id>` 字符串。
+ * 不合法返回 null。QQ 号去掉前导零，避免同一会话出现多个别名。
+ */
+function parseConvKey(key) {
+  const m = /^(group|private):(\d+|tg-?\d+)$/.exec(String(key ?? '').trim());
   if (!m) return null;
+  if (m[2].startsWith('tg')) {
+    const chatId = tgChatIdOf(m[2]);
+    // Telegram 私聊的 chat_id 就是用户 id，一定是正数；群是负数。
+    if (chatId === null || (m[1] === 'private' && chatId < 0)) return null;
+    return { kind: m[1], id: tgConvId(chatId), telegram: true };
+  }
   const id = Number(m[2]);
   if (!Number.isSafeInteger(id) || id <= 0) return null;
-  return `${m[1]}:${id}`;
+  return { kind: m[1], id, telegram: false };
+}
+
+// 二代会话 key 规范化：只接受 parseConvKey 认得的格式，统一成规范写法，避免同一会话出现多个别名。
+function canonicalV2Key(key) {
+  const p = parseConvKey(key);
+  return p ? `${p.kind}:${p.id}` : null;
 }
 
 const APPROVE_WORDS = new Set(['通过', '同意', '允许', '批准', 'yes', 'y', 'approve', 'ok']);
@@ -1713,6 +1742,7 @@ async function main() {
    * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
    */
   async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
+    if (parseConvKey(key)?.telegram) throw new Error(TELEGRAM_UNSUPPORTED);
     const vc = voiceCfg();
     // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
     // AI 路由（/api/socialV2/send-voice）与 sendVoiceForV2 里。底层只管发，
@@ -1902,6 +1932,7 @@ async function main() {
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
+    if (parseConvKey(key)?.telegram) throw new Error(TELEGRAM_UNSUPPORTED);
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
@@ -2389,6 +2420,97 @@ async function main() {
   if (!cfg.ownerQQ) {
     log('⚠️  未配置 ownerQQ：审批/管理命令/封闭 agent 模式将全部不可用。请在 config.json 或控制台「访问与安全」页填写管理员 QQ');
   }
+
+  // ── Telegram（可选的第二个入口）──────────────────────────────────────────
+  // 和 QQ 共用同一套会话、人设和 DSH；会话 key 形如 private:tg123 / group:tg-100…。
+  // client 在配置无误时创建；me（getMe 的结果）连上之后才有，没有 me 时不收也不发。
+  const tg = { client: null, me: null, cache: createTelegramMessageCache(), stop: null };
+  if (cfg.telegram.enabled) {
+    const problems = telegramConfigProblems(cfg.telegram);
+    if (problems.length) {
+      log(`⚠️  Telegram 接入未启动：${problems.join('；')}`);
+    } else {
+      tg.client = new TelegramClient(cfg.telegram);
+      if (!cfg.telegram.allow.private.length && !cfg.telegram.allow.groups.length && !cfg.telegram.ownerId) {
+        log('⚠️  Telegram 白名单为空且没配 telegram.ownerId：bot 会忽略所有消息。被忽略的会话会在日志里打出 id，照着填进 telegram.allow 即可');
+      }
+    }
+  }
+
+  /** 这个用户 id 是不是管理员（QQ 的 ownerQQ，或 Telegram 的 telegram.ownerId）。 */
+  function isOwnerUserId(userId) {
+    const s = String(userId ?? '');
+    if (!s) return false;
+    if (cfg.ownerQQ && s === String(cfg.ownerQQ)) return true;
+    return !!cfg.telegram?.ownerId && s === tgConvId(cfg.telegram.ownerId);
+  }
+
+  /** 是不是管理员自己的私聊（QQ 或 Telegram）。 */
+  function isOwnerPrivateKey(key) {
+    const k = String(key ?? '');
+    return k.startsWith('private:') && isOwnerUserId(k.slice('private:'.length));
+  }
+
+  /** 往 Telegram 会话发一条文字；成功后把它记进引用缓存（别人引用她的话时才认得出来）。 */
+  async function telegramSend(convId, message, { replyTo = null, atUserId = null } = {}) {
+    if (!tg.client || !tg.me) throw new Error('Telegram 未连接');
+    const chatId = tgChatIdOf(convId);
+    if (chatId === null) throw new Error(`不是 Telegram 会话：${convId}`);
+    let mention = null;
+    if (atUserId !== null && atUserId !== undefined && String(atUserId).trim() !== '') {
+      const raw = String(atUserId).trim();
+      const uid = tgChatIdOf(raw) ?? (/^[1-9]\d*$/.test(raw) ? Number(raw) : null);
+      if (uid === null || uid <= 0) throw new Error('atUserId 必须是 Telegram 用户 id（消息里的 tg 开头那串）');
+      mention = { userId: uid, name: tg.cache.nameOf(chatId, tgConvId(uid)) || 'TA' };
+    }
+    const sent = await tg.client.sendText(chatId, message, { replyTo, mention });
+    if (sent?.message_id != null) {
+      tg.cache.remember(chatId, sent.message_id, {
+        userId: tgConvId(tg.me.id),
+        sender: tg.me.first_name || selfDisplayName || '我',
+        text: String(sent.text ?? message).slice(0, 200)
+      });
+    }
+    return sent;
+  }
+
+  /** 连上 Telegram（getMe 失败就退避重试），然后开始长轮询收消息。 */
+  async function startTelegram() {
+    let delay = 5000;
+    let lastError = '';
+    while (!tg.me) {
+      try {
+        tg.me = await tg.client.getMe();
+      } catch (error) {
+        const message = error?.message ?? String(error);
+        if (error?.code === 401 || error?.code === 404) {
+          log(`⛔ Telegram botToken 无效（${message}），已停止 Telegram 接入。请检查 config.json 的 telegram.botToken`);
+          return;
+        }
+        if (message !== lastError) {
+          log(`⚠️  连不上 Telegram：${message}${error?.code === 'network' ? '（国内一般要配 telegram.proxy，比如 http://127.0.0.1:7890）' : ''}；会在后台自动重试`);
+        }
+        lastError = message;
+        await sleep(delay);
+        delay = Math.min(60000, delay * 2);
+      }
+    }
+    log(`Telegram 已连接：@${tg.me.username ?? '?'}（${tg.me.first_name ?? ''}）`);
+    tg.stop = startTelegramPolling({
+      client: tg.client,
+      timeoutSec: cfg.telegram.pollTimeoutSec,
+      log,
+      onUpdate: async (update) => {
+        const r = updateToEvent(update, tg.me, { cache: tg.cache, maxMediaBytes: MAX_MEDIA_BYTES });
+        if (!r) return;
+        if (r.skip) {
+          log(`Telegram：跳过一条消息（${r.skip}）`);
+          return;
+        }
+        await handleIncoming(r.kind, r.id, r.event, cfg);
+      }
+    });
+  }
   if (cfg.socialV2?.voice?.allowAbsolutePath === true) {
     // 该开关曾经允许 AI 发送语音库之外的任意本机音频文件（prompt injection 可用来外发文件）。
     // 现在无论开关如何，AI 通道都只接受语音库内的文件；这里提示它已经不再放宽边界。
@@ -2740,9 +2862,9 @@ async function main() {
 
   /** 判断一个会话 key 是否仍被当前模式/白名单允许（供唤醒调度与 HTTP 路由共用）。 */
   function isSessionAllowedInCurrentMode(key) {
-    const m = /^(group|private):(\d+)$/.exec(key);
-    if (!m) return false;
-    return modeAllowed(key, m[1], Number(m[2]), cfg, currentMode);
+    const p = parseConvKey(key);
+    if (!p) return false;
+    return modeAllowed(key, p.kind, p.id, cfg, currentMode);
   }
 
   function sessionPolicy(key) {
@@ -2865,9 +2987,8 @@ async function main() {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           try {
-            const [kind, idStr] = key.split(':');
-            const id = Number(idStr);
-            if (!modeAllowed(key, kind, id, cfg, currentMode)) {
+            const parsed = parseConvKey(key);
+            if (!parsed || !modeAllowed(key, parsed.kind, parsed.id, cfg, currentMode)) {
               log(`补投跳过未授权会话 ${key}（当前模式 ${currentMode}）`);
               continue;
             }
@@ -4044,7 +4165,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/sessions') {
           const list = [];
           for (const [key, sessionId] of Object.entries(state.sessions)) {
-            list.push({ key, sessionId, owner: key === `private:${String(cfg.ownerQQ ?? '')}` });
+            list.push({ key, sessionId, owner: isOwnerPrivateKey(key) });
           }
           sendJson({ sessions: list });
           return;
@@ -4359,17 +4480,13 @@ async function main() {
             sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400);
             return;
           }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) {
             sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400);
             return;
           }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0) {
-            sendJson({ ok: false, error: 'id 无效' }, 400);
-            return;
-          }
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
           if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: `该会话不在当前模式（${currentMode}）允许范围内` }, 403);
             return;
@@ -4729,7 +4846,11 @@ async function main() {
             key,
             time: new Date().toISOString(),
             // 机器人自己的身份：agent 需要它才能把「@樰」对到自己身上（issue #29）。
-            self: {
+            self: parseConvKey(key)?.telegram ? {
+              nickname: tg.me?.first_name || null,
+              userId: tg.me ? tgConvId(tg.me.id) : null,
+              line: telegramIdentityTextV2().trim() || null
+            } : {
               nickname: selfDisplayName || null,
               userId: selfUserId || null,
               line: selfIdentityTextV2().trim() || null
@@ -5018,11 +5139,11 @@ async function main() {
           const reason = String(body.reason ?? 'admin').trim() || 'admin';
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -5148,14 +5269,14 @@ async function main() {
             return;
           }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) {
             sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400);
             return;
           }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -5274,11 +5395,11 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -5386,11 +5507,12 @@ async function main() {
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (!v2ToolEnabled('sendPoke')) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
           if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停，不能发送拍一拍' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '当前模式不允许操作该会话' }, 403);
             return;
           }
@@ -5698,11 +5820,12 @@ async function main() {
           if (!v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -5769,11 +5892,12 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -5866,8 +5990,9 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
           const st = getSocialV2State(key);
           const collectCfg = cfg.socialV2?.sticker?.collect ?? {};
           if (collectCfg.enabled === false) { sendJson({ ok: false, error: 'AI 收藏表情功能已关闭' }, 403); return; }
@@ -6379,10 +6504,10 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getMessageDetail')) { sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
           try {
             const st = getSocialV2State(key);
             const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === messageId || (m.messageId && String(m.messageId) === messageId)));
@@ -6427,8 +6552,9 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const id = String(url.searchParams.get('id') ?? '').trim();
           const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
           if (!id) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
           if (currentMode !== 'reserved2') {
             sendJson({ ok: false, error: '合并转发查看仅 reserved2 模式可用' }, 403);
@@ -6442,9 +6568,9 @@ async function main() {
             sendJson({ ok: false, error: 'agent token 无效' }, 403);
             return;
           }
-          const kind = keyMatch[1];
-          const num = Number(keyMatch[2]);
-          if (!Number.isFinite(num) || num <= 0 || !modeAllowed(key, kind, num, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const num = keyMatch.id;
+          if (!modeAllowed(key, kind, num, cfg, currentMode)) {
             sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
             return;
           }
@@ -6796,7 +6922,7 @@ async function main() {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const token = String(body.token ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           if (!token || !agentTokenOk(key, token)) {
             // 空 token 一律拒绝：该端点对 agent 流量开放（见 startConsoleServer 里的
@@ -6805,9 +6931,9 @@ async function main() {
             sendJson({ ok: false, error: token ? 'agent token 无效' : '缺少会话令牌；旧只读工具在需要令牌的模式下不可用，请改用带会话令牌的 v2 读工具' }, 403);
             return;
           }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
             return;
           }
@@ -6819,7 +6945,7 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const messageId = String(url.searchParams.get('messageId') ?? '').trim();
           const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
           if (currentMode === 'reserved2' && !agentToken) {
@@ -6834,9 +6960,9 @@ async function main() {
             sendJson({ ok: false, error: 'agent token 无效' }, 403);
             return;
           }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
             return;
           }
@@ -6901,11 +7027,11 @@ async function main() {
             sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403);
             return;
           }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式无效' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const kind = keyMatch.kind;
+          const id = keyMatch.id;
+          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -7164,7 +7290,8 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          if (isTelegramConvId(id)) await withTimeout(telegramSend(id, part), SEND_TIMEOUT_MS, `Telegram发送 ${kind}:${id}`);
+          else if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
         })
         .catch((error) => {
@@ -7356,7 +7483,8 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+          if (isTelegramConvId(id)) await withTimeout(telegramSend(id, msg), SEND_TIMEOUT_MS, `Telegram发送 ${kind}:${id}`);
+          else if (kind === 'private') await withTimeout(bot.sendPrivateMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           else await withTimeout(bot.sendGroupMessage(Number(id), text(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
           sent.push(msg);
         })
@@ -7379,10 +7507,23 @@ async function main() {
 
   async function onebotSend(kind, id, message, replyToMessageId, atUserId = null) {
     const segments = [];
+    const isTelegram = isTelegramConvId(id);
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
       segments.push({ type: 'reply', data: { id: rid } });
+    }
+    // Telegram：@ 和引用由 telegramSend 自己处理（@ 的是 tg 开头的用户 id，不是 QQ 号）。
+    if (isTelegram) {
+      const rawMessage = String(message ?? '');
+      if ([...KNOWN_AGENT_TOKENS].some((t) => t && rawMessage.includes(t))) {
+        log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
+        throw new Error('发送内容包含会话令牌，已阻止发送');
+      }
+      const replyTo = segments.length ? Number(segments[0].data.id) : null;
+      if (replyTo !== null && replyTo <= 0) throw new Error('Telegram 的 replyToMessageId 必须是正整数');
+      const sent = await withTimeout(telegramSend(id, rawMessage, { replyTo, atUserId }), SEND_TIMEOUT_MS, `Telegram发送 ${kind}:${id}`);
+      return { message_id: sent?.message_id ?? null };
     }
     if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
       const at = String(atUserId).trim();
@@ -7579,6 +7720,17 @@ async function main() {
   }
 
   async function fetchOneBotImage(media) {
+    // Telegram 图片只登记了 file_id（`tgfile:` 前缀），要用到时再通过 Bot API 下载。
+    if (String(media?.file ?? '').startsWith('tgfile:')) {
+      if (!tg.client) return null;
+      try {
+        const buf = await tg.client.downloadFile(String(media.file).slice('tgfile:'.length), MAX_MEDIA_BYTES);
+        return acceptImageBuffer(buf, 'Telegram 图片');
+      } catch (error) {
+        log(`[media] Telegram 图片获取失败：${error?.message ?? error}`);
+        return null;
+      }
+    }
     // 表情包（市场/收藏表情）优先走 CDN：get_image 对市场表情必然失败
     // （SnowLuma 缓存里没有该文件），先试 URL 能省一次失败往返，也更可靠。
     const emojiId = String(media.emojiId || emojiIdFromFileName(media.file) || '');
@@ -7923,7 +8075,7 @@ async function main() {
   // 静默模式：除 owner 私聊外，不发送任何在途 AI 回复。
   function shouldBlockSilentReply(key) {
     const roleState = readRoleState();
-    return roleState.mode === 'silent' && key !== `private:${String(cfg.ownerQQ ?? '')}`;
+    return roleState.mode === 'silent' && !isOwnerPrivateKey(key);
   }
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
@@ -8117,7 +8269,7 @@ async function main() {
     const clean = [];
     for (const v of rawList) {
       const s = String(v ?? '').trim();
-      if (!/^[1-9]\d*$/.test(s)) continue;
+      if (!/^[1-9]\d*$/.test(s) && !/^tg[1-9]\d*$/.test(s)) continue;
       if (seen.has(s)) continue;
       seen.add(s);
       clean.push(s);
@@ -8347,7 +8499,7 @@ async function main() {
         const seenTokens = new Set();
         for (const [key, val] of Object.entries(raw.conversations)) {
           if (!val || typeof val !== 'object') continue;
-          if (!/^(group|private):\d+$/.test(key)) continue;
+          if (!parseConvKey(key)) continue;
           const defaultWc = defaultWakeConfigV2();
           let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
           if (!agentToken || seenTokens.has(agentToken)) {
@@ -8797,6 +8949,8 @@ async function main() {
     const lower = String(textContent ?? '').toLowerCase();
     const selfId = String(event?.self_id ?? '');
     if (selfId && lower.includes('@' + selfId)) return true;
+    // 文字里的 @ 已被解析成名字时，按 at 段判断（Telegram 的 @bot 就是这样）
+    if (selfId && Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === selfId)) return true;
     if (selfNickname && (lower.includes('@' + selfNickname) || lower.includes(selfNickname))) return true;
     for (const kw of (cfg.social?.mustReplyKeywords ?? [])) {
       if (lower.includes(String(kw).toLowerCase())) return true;
@@ -9505,6 +9659,11 @@ async function main() {
   }
 
   async function resolveGroupMemberName(groupId, userId) {
+    const tgChat = tgChatIdOf(groupId);
+    if (tgChat !== null) {
+      if (tg.me && String(userId) === tgConvId(tg.me.id)) return tg.me.first_name || selfDisplayName || null;
+      return tg.cache.nameOf(tgChat, String(userId));
+    }
     const key = `${String(groupId)}:${String(userId)}`;
     const hit = groupMemberNameCache.get(key);
     if (hit && Date.now() - hit.ts < GROUP_MEMBER_NAME_TTL_MS) return hit.name;
@@ -9552,6 +9711,12 @@ async function main() {
     }
   }
   async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
+    // Telegram 没有按 id 取历史消息的接口，只能查收发时记下的缓存（缓存按会话分开，天然不会跨会话）。
+    const tgChat = tgChatIdOf(convId);
+    if (tgChat !== null) {
+      const hit = tg.cache.get(tgChat, String(messageId));
+      return hit ? { sender: String(hit.sender ?? ''), text: String(hit.text ?? '').slice(0, 200), userId: hit.userId ?? null } : null;
+    }
     pruneReplyInfoCache();
     const cacheKey = `${kind}:${String(convId)}:${String(messageId)}`;
     const hit = replyInfoCache.get(cacheKey);
@@ -9716,7 +9881,7 @@ async function main() {
       tail: truncateTextTail(String(plainContent ?? textContent), 200),
       quoteTargetIsSelf: !!quoteTargetIsSelf,
       isOwner: !!isOwner,
-      ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
+      ownerLabel: isOwner ? (isTelegramConvId(userId) ? '管理员（Telegram）' : `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）`) : '',
       isSelf: false,
       media: safeMedia,
       hasMedia: safeMedia.length > 0,
@@ -10070,10 +10235,21 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  /** Telegram 会话的身份说明：和 QQ 是同一个你，但这里只能收发文字和看图。 */
+  function telegramIdentityTextV2() {
+    const name = tg.me?.first_name || selfDisplayName || '';
+    const handle = tg.me?.username ? `@${tg.me.username}` : '';
+    const id = tg.me ? tgConvId(tg.me.id) : '';
+    return `【你的身份】这是 Telegram 上的会话（不是 QQ），你在这里叫「${name || '（未取到）'}」${handle ? `（${handle}）` : ''}。`
+      + `消息里 @ 你${id ? `（at 段里是 ${id}）` : ''}、或引用你的消息，指的都是你。`
+      + '这里只能发文字：拍一拍、QQ 表情包、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
-    const identityLine = selfIdentityTextV2();
+    const isTelegram = parseConvKey(key)?.telegram === true;
+    const identityLine = isTelegram ? telegramIdentityTextV2() : selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
@@ -10084,7 +10260,7 @@ async function main() {
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
-    const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
+    const stickerLine = !isTelegram && stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
@@ -10140,7 +10316,8 @@ async function main() {
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
-    const identityLine = selfIdentityTextV2();
+    const isTelegram = parseConvKey(key)?.telegram === true;
+    const identityLine = isTelegram ? telegramIdentityTextV2() : selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
@@ -10623,7 +10800,7 @@ async function main() {
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    const isOwner = isOwnerUserId(event.user_id);
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -11795,6 +11972,7 @@ async function main() {
     // 日志里的「token 自愈失败」与 config.json 的 snowluma.homeDir。
     log(`SnowLuma 首次连接未成功（将在后台自动重连并尝试自愈 WS token）: ${error?.message ?? error}`);
   });
+  if (tg.client) void startTelegram();
   log('桥接已启动。按 Ctrl+C 退出。');
   // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
   if (cfg.socialV2?.sticker?.enabled !== false) {

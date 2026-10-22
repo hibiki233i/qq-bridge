@@ -112,6 +112,25 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 这个页面不依赖桥接，桥接还没跑起来也能用。它只改这几项，其余字段原样保留；保存前会把旧文件备份成 `config.json.bak`。
 参数：`--no-open` 只打印地址，`--port 3199` 指定端口，`--config 路径` 改别的配置文件。
 
+**同时接 Telegram（可选）**：在 `config.json` 里加一段 `telegram`（配置页里也能填）。和 QQ 共用同一套人设、记忆和 DSH，Telegram 会话的 key 写成 `private:tg<用户id>` / `group:tg<群id>`。
+
+```json
+"telegram": {
+  "enabled": true,
+  "botToken": "找 @BotFather 用 /newbot 创建后给的 token",
+  "proxy": "http://127.0.0.1:7890",
+  "ownerId": 123456789,
+  "allow": { "private": [], "groups": [-1001234567890] }
+}
+```
+
+- 收消息用长轮询（getUpdates），不需要公网地址；国内直连不通，`proxy` 填本机 HTTP 代理。
+- 名单和 QQ 的分开存；名单为空就谁也不理（不跟随 `allowAllWhenEmpty`）。`ownerId` 的私聊总是放行，也能用 `/reset` 等管理命令；封闭 agent 模式（closed-agent）仍只认 QQ 管理员。
+- 不知道 id：先启用并启动桥接，给 bot 发一句话，日志里「忽略未授权会话 private:tg123…」里 `tg` 后面的数字就是。
+- 目前支持文字和图片（收图给模型看、发文字、引用、@）。拍一拍、QQ 表情包、语音、合并转发只在 QQ 上有，Telegram 会话调用这些工具会直接返回"不支持"。
+- 想让她看到群里所有消息，要在 @BotFather 里 `/setprivacy` → Disable，再把 bot 移出群重新拉进来。
+- 桥接停机期间积压超过 10 分钟的 Telegram 消息，重启后不再回复。
+
 | 字段 | 说明 |
 | --- | --- |
 | `dsh.baseUrl` | DSH Web 地址，默认 `http://127.0.0.1:3080` |

@@ -80,7 +80,7 @@ code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:
 <body>
 <main>
   <h1>qq-bridge 连接配置</h1>
-  <p class="sub">桥接启动前要连上 QQ 网关和 DeepSeek Harness。这里改的是 <code id="cfgPath">config.json</code> 里这几项，其余设置原样保留。</p>
+  <p class="sub">桥接启动前要连上 QQ 网关和 DeepSeek Harness（Telegram 可选）。这里改的是 <code id="cfgPath">config.json</code> 里这几项，其余设置原样保留。</p>
 
   <div id="banner" class="banner" role="status"></div>
 
@@ -169,6 +169,52 @@ code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:
       </div>
     </div>
   </section>
+
+  <section class="card" aria-labelledby="h-tg">
+    <h2 id="h-tg">Telegram（可选）</h2>
+    <p class="hint">和 QQ 是同一个她：同一套人设、记忆和 DSH。目前收发文字和图片；拍一拍、QQ 表情包、语音只在 QQ 上有。</p>
+    <div class="grid">
+      <div class="full">
+        <label class="check"><input type="checkbox" id="tgEnabled">
+          <span>启用 Telegram</span></label>
+      </div>
+      <div>
+        <label for="tgToken">Bot token</label>
+        <div class="row">
+          <input type="password" id="tgToken" autocomplete="off" spellcheck="false" placeholder="123456789:AA…">
+          <button type="button" id="toggleTgToken" aria-label="显示 Bot token">显示</button>
+        </div>
+        <div class="field-note">在 Telegram 里找 @BotFather，发 /newbot 创建</div>
+      </div>
+      <div>
+        <label for="tgProxy">代理</label>
+        <input type="text" id="tgProxy" spellcheck="false" placeholder="http://127.0.0.1:7890">
+        <div class="field-note">国内直连不通，要填 HTTP 代理（Clash 默认 7890）</div>
+      </div>
+      <div class="full">
+        <label for="tgOwner">管理员 Telegram id（你自己）</label>
+        <input type="text" id="tgOwner" inputmode="numeric" placeholder="123456789">
+        <div class="field-note">管理员的私聊总是放行，也能用 /reset 等管理命令</div>
+      </div>
+      <div>
+        <label for="tgAllowPrivate">私聊白名单</label>
+        <textarea id="tgAllowPrivate" placeholder="123456789"></textarea>
+      </div>
+      <div>
+        <label for="tgAllowGroups">群白名单</label>
+        <textarea id="tgAllowGroups" placeholder="-1001234567890"></textarea>
+        <div class="field-note">群 id 是负数，一般 -100 开头</div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px"><button type="button" id="testTg">测试连接</button></div>
+    <div id="tgResult" class="result" aria-live="polite"></div>
+    <details>
+      <summary>怎么知道自己和群的 id？</summary>
+      <p class="hint" style="margin-top:8px">先把 token 填好、启用、保存，然后启动桥接。用你自己的号给 bot 发一句话（群的话把 bot 拉进群再 @ 它），桥接日志里会出现
+        <code>忽略未授权会话 private:tg123456789</code> 或 <code>group:tg-1001234567890</code>，<code>tg</code> 后面那串就是 id，填回这里再重启桥接。</p>
+      <p class="hint">想让她看到群里<strong>所有</strong>消息（而不只是 @ 她的），要在 @BotFather 里 <code>/setprivacy</code> → 选这个 bot → <code>Disable</code>，然后把 bot 移出群再拉回来。</p>
+    </details>
+  </section>
 </main>
 
 <div class="bar" id="bar">
@@ -205,7 +251,15 @@ function readForm() {
     ownerQQ: $('owner').value.trim(),
     allowPrivate: splitIds($('allowPrivate').value),
     allowGroups: splitIds($('allowGroups').value),
-    allowAllWhenEmpty: $('allowAll').checked
+    allowAllWhenEmpty: $('allowAll').checked,
+    telegram: {
+      enabled: $('tgEnabled').checked,
+      botToken: $('tgToken').value.trim(),
+      proxy: $('tgProxy').value.trim(),
+      ownerId: $('tgOwner').value.trim(),
+      allowPrivate: splitIds($('tgAllowPrivate').value),
+      allowGroups: splitIds($('tgAllowGroups').value)
+    }
   };
 }
 
@@ -221,6 +275,12 @@ function fillForm(f) {
   $('allowPrivate').value = f.allowPrivate.join(', ');
   $('allowGroups').value = f.allowGroups.join(', ');
   $('allowAll').checked = f.allowAllWhenEmpty;
+  $('tgEnabled').checked = f.telegram.enabled;
+  $('tgToken').value = f.telegram.botToken;
+  $('tgProxy').value = f.telegram.proxy;
+  $('tgOwner').value = f.telegram.ownerId;
+  $('tgAllowPrivate').value = f.telegram.allowPrivate.join(', ');
+  $('tgAllowGroups').value = f.telegram.allowGroups.join(', ');
 }
 
 function banner(kind, html) {
@@ -301,6 +361,26 @@ $('testDsh').addEventListener('click', async () => {
   }
 });
 
+$('testTg').addEventListener('click', async () => {
+  const btn = $('testTg');
+  const box = $('tgResult');
+  btn.disabled = true; btn.textContent = '测试中…';
+  try {
+    const t = readForm().telegram;
+    const r = await api('/api/test/telegram', { botToken: t.botToken, proxy: t.proxy });
+    let html = r.ok ? pill('ok', 'Telegram ✓ ', r.bot) : pill('bad', 'Telegram ✗ ', r.error);
+    if (r.ok && r.webhook) html += pill('warn', '注意 ', '这个 bot 设置了 webhook，桥接会收不到消息；先在别处删掉 webhook');
+    if (r.ok && !r.readsAllGroupMessages) html += pill('warn', '群聊 ', '只能收到 @它、回复它的消息（隐私模式开着）');
+    if (r.ok && !t.enabled) html += pill('warn', '提示 ', '还没勾选「启用 Telegram」');
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = pill('bad', '测试失败 ', e.message);
+  } finally {
+    box.classList.add('show');
+    btn.disabled = false; btn.textContent = '测试连接';
+  }
+});
+
 $('save').addEventListener('click', async () => {
   const btn = $('save');
   btn.disabled = true; btn.textContent = '保存中…';
@@ -333,6 +413,13 @@ $('toggleToken').addEventListener('click', () => {
   $('toggleToken').setAttribute('aria-label', show ? '隐藏令牌' : '显示令牌');
 });
 
+$('toggleTgToken').addEventListener('click', () => {
+  const show = $('tgToken').type === 'password';
+  $('tgToken').type = show ? 'text' : 'password';
+  $('toggleTgToken').textContent = show ? '隐藏' : '显示';
+  $('toggleTgToken').setAttribute('aria-label', show ? '隐藏 Bot token' : '显示 Bot token');
+});
+
 $('genToken').addEventListener('click', () => {
   if ($('token').value && !confirm('替换现有 token？NapCat 那边也要改成新的。')) return;
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -357,6 +444,7 @@ $('done').addEventListener('click', async () => {
 // 网关字段一改，上次的测试结果就不作数了
 ['impl', 'wsUrl', 'httpUrl', 'token', 'follow'].forEach((id) => $(id).addEventListener('input', () => $('gwResult').classList.remove('show')));
 ['dshUrl', 'dshToken'].forEach((id) => $(id).addEventListener('input', () => $('dshResult').classList.remove('show')));
+['tgToken', 'tgProxy', 'tgEnabled'].forEach((id) => $(id).addEventListener('input', () => $('tgResult').classList.remove('show')));
 document.addEventListener('input', updateDirty);
 document.addEventListener('change', updateDirty);
 window.addEventListener('beforeunload', (e) => { if (!$('save').disabled) { e.preventDefault(); e.returnValue = ''; } });

@@ -34,6 +34,16 @@
     "groups": []
   },
   "allowAllWhenEmpty": false,
+  "telegram": {
+    "enabled": false,
+    "botToken": "",
+    "proxy": "",
+    "ownerId": null,
+    "allow": {
+      "private": [],
+      "groups": []
+    }
+  },
   "ackMessage": "",
   "sendDelayMs": 300,
   "questionTimeoutMs": 300000,

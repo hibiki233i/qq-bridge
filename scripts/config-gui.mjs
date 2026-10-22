@@ -18,6 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { TelegramClient } from '../src/telegram.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -67,8 +68,34 @@ export function toForm(file) {
     ownerQQ: file.ownerQQ == null ? '' : String(file.ownerQQ),
     allowPrivate: (file.allow?.private ?? []).map(String),
     allowGroups: (file.allow?.groups ?? []).map(String),
-    allowAllWhenEmpty: file.allowAllWhenEmpty === true
+    allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    telegram: {
+      enabled: file.telegram?.enabled === true,
+      botToken: String(file.telegram?.botToken ?? ''),
+      proxy: String(file.telegram?.proxy ?? ''),
+      ownerId: file.telegram?.ownerId == null ? '' : String(file.telegram.ownerId),
+      allowPrivate: (file.telegram?.allow?.private ?? []).map(String),
+      allowGroups: (file.telegram?.allow?.groups ?? []).map(String)
+    }
   };
+}
+
+const TG_TOKEN_RE = /^\d{5,}:[A-Za-z0-9_-]{30,}$/;
+
+/** Telegram id：用户是正数，群是负数（超级群形如 -100…）。 */
+function checkTgIds(list, label, errors, { allowNegative }) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const s = String(raw).trim();
+    if (!s) continue;
+    const n = Number(s);
+    if (!/^-?\d{1,16}$/.test(s) || !Number.isSafeInteger(n) || n === 0 || (n < 0 && !allowNegative)) {
+      errors.push(`${label} 里的「${s}」不像 Telegram ${allowNegative ? '群 id（一般是 -100 开头的负数）' : '用户 id（正整数）'}`);
+      continue;
+    }
+    if (!out.includes(n)) out.push(n);
+  }
+  return out;
 }
 
 function checkUrl(value, protocols, label, errors) {
@@ -106,6 +133,16 @@ export function applyForm(file, form) {
   if (owner && !/^\d{5,12}$/.test(owner)) errors.push(`管理员 QQ「${owner}」不像 QQ 号`);
   const allowPrivate = checkIds(form?.allowPrivate, '私聊白名单', errors);
   const allowGroups = checkIds(form?.allowGroups, '群白名单', errors);
+  const t = form?.telegram ?? {};
+  const tgEnabled = t.enabled === true;
+  const botToken = String(t.botToken ?? '').trim();
+  if (botToken && !TG_TOKEN_RE.test(botToken)) errors.push('Telegram Bot token 格式不对（应形如 123456789:AA…，找 @BotFather 要）');
+  if (tgEnabled && !botToken) errors.push('启用 Telegram 需要填 Bot token');
+  const proxyRaw = String(t.proxy ?? '').trim();
+  const proxy = proxyRaw ? checkUrl(proxyRaw, ['http:'], 'Telegram 代理', errors) : '';
+  const tgOwnerList = checkTgIds([t.ownerId ?? ''], 'Telegram 管理员', errors, { allowNegative: false });
+  const tgAllowPrivate = checkTgIds(t.allowPrivate, 'Telegram 私聊白名单', errors, { allowNegative: false });
+  const tgAllowGroups = checkTgIds(t.allowGroups, 'Telegram 群白名单', errors, { allowNegative: true });
   if (errors.length) return { errors };
 
   const next = structuredClone(file);
@@ -118,6 +155,19 @@ export function applyForm(file, form) {
   // 原文件里写着 false 就保留 false；本来没有这个键、也没勾选，就别凭空加一个
   if (form?.allowAllWhenEmpty === true) next.allowAllWhenEmpty = true;
   else if ('allowAllWhenEmpty' in next) next.allowAllWhenEmpty = false;
+  // 原来没有 telegram 段、这次也什么都没填，就别凭空加一段
+  const tgTouched = tgEnabled || botToken || proxy || tgOwnerList.length || tgAllowPrivate.length || tgAllowGroups.length;
+  if ('telegram' in next || tgTouched) {
+    const prev = next.telegram ?? {};
+    next.telegram = {
+      ...prev,
+      enabled: tgEnabled,
+      botToken,
+      proxy,
+      ownerId: tgOwnerList[0] ?? null,
+      allow: { ...(prev.allow ?? {}), private: tgAllowPrivate, groups: tgAllowGroups }
+    };
+  }
   return { file: next };
 }
 
@@ -210,6 +260,32 @@ async function testDsh(baseUrl) {
   }
 }
 
+async function testTelegram({ botToken, proxy }, apiBase) {
+  const token = String(botToken ?? '').trim();
+  if (!TG_TOKEN_RE.test(token)) return { ok: false, error: 'Bot token 格式不对（应形如 123456789:AA…）' };
+  const p = String(proxy ?? '').trim();
+  if (p) {
+    try { if (new URL(p).protocol !== 'http:') return { ok: false, error: '代理只支持 http:// 开头的 HTTP 代理' }; }
+    catch { return { ok: false, error: `代理地址不合法：${p}` }; }
+  }
+  const client = new TelegramClient({ botToken: token, apiBase: apiBase || undefined, proxy: p });
+  try {
+    const me = await client.call('getMe', {}, { timeoutMs: 10000 });
+    let webhook = false;
+    try { webhook = !!(await client.call('getWebhookInfo', {}, { timeoutMs: 10000 }))?.url; } catch {}
+    return {
+      ok: true,
+      bot: `@${me.username ?? '?'}（${me.first_name ?? ''}）`,
+      readsAllGroupMessages: me.can_read_all_group_messages === true,
+      webhook
+    };
+  } catch (error) {
+    if (error?.code === 401 || error?.code === 404) return { ok: false, error: 'token 无效（Telegram 不认）' };
+    if (error?.code === 'network') return { ok: false, error: `连不上 Telegram${p ? '（代理是否开着？）' : '：国内要填代理'}`, detail: error.message };
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+}
+
 // ── HTTP 服务 ────────────────────────────────────────────────────────────
 function send(res, code, body, type = 'application/json; charset=utf-8') {
   res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
@@ -258,6 +334,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/test/dsh') {
       const b = await readBody(req);
       return send(res, 200, { ...(await testDsh(b.baseUrl)), remote: !isLoopback(b.baseUrl) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/test/telegram') {
+      const b = await readBody(req);
+      return send(res, 200, await testTelegram(b, loadFile().file.telegram?.apiBase));
     }
     if (req.method === 'POST' && url.pathname === '/api/shutdown') {
       send(res, 200, { ok: true });
