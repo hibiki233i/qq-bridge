@@ -527,10 +527,6 @@ await test('桥接：二代模式 Telegram 会话能入库、能发送，QQ 专�
       });
       assert.equal(poke.status, 400);
       assert.match(poke.json.error, /Telegram/);
-      const sticker = await consoleCall(port, '/api/socialV2/send-sticker', {
-        method: 'POST', token: st.agentToken, body: { key: 'group:tg-100500', sticker: '1' }
-      });
-      assert.equal(sticker.status, 400);
       const wrongToken = await consoleCall(port, '/api/socialV2/send-message', {
         method: 'POST', token: h.getSocialV2State('group:456').agentToken, body: { key: 'group:tg-100500', messages: ['x'] }
       });
@@ -560,7 +556,11 @@ await test('桥接：表情包工具在 Telegram 会话里发成图片，不走 
     assert.ok(!qqHttp.some((u) => /send_(group|private)_msg/.test(u)), '不能发到 QQ');
     const info = await h.resolveReplyInfo('group', 'tg-100500', '777', 'tg7000');
     assert.match(info.text, /^\[表情包:/, '别人引用这张表情时知道是她发的表情包');
+    const fetchesBefore = qqHttp.length;
     await assert.rejects(h.sendStickerV2('group:tg-100500', 'fixture-sticker', { atUserId: 'abc' }), /atUserId/, '@ 的不是 Telegram 用户 id 就拒绝');
+    await assert.rejects(h.sendStickerV2('group:tg-100500', 'fixture-sticker', { atUserId: '222' }), /atUserId/, '没有 tg 前缀的数字也拒绝（多半是把 QQ 号填进来了）');
+    assert.equal(calls.filter((c) => c.image).length, 1, '校验失败时不上传');
+    assert.equal(qqHttp.length, fetchesBefore);
   } finally { await h.close(); }
 });
 
@@ -576,6 +576,16 @@ await test('桥接：二代 send-sticker 接口对 Telegram 会话放行；下�
       const ok = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', stickerId: 'fixture-sticker' } });
       assert.equal(ok.status, 200, ok.body);
       assert.equal(calls.filter((c) => c.image).length, 1);
+      const sendTimesBefore = st.sendTimes.length;
+      const badAt = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'group:tg-100500', stickerId: 'fixture-sticker', atUserId: '12345' } });
+      assert.equal(badAt.status, 403, '群会话不在这个令牌下');
+      const stG = h.getSocialV2State('group:tg-100500');
+      const gBefore = stG.sendTimes.length;
+      const badAtG = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: stG.agentToken, body: { key: 'group:tg-100500', stickerId: 'fixture-sticker', atUserId: '12345' } });
+      assert.equal(badAtG.status, 400, badAtG.body);
+      assert.match(badAtG.json.error, /tg 开头/);
+      assert.equal(stG.sendTimes.length, gBefore, '@ 不合法时不占发送额度');
+      assert.equal(st.sendTimes.length, sendTimesBefore);
       payload = Buffer.from('<html>not an image</html>');
       const bad = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', stickerId: 'fixture-sticker' } });
       assert.equal(bad.status, 500);

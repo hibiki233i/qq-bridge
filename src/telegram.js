@@ -22,6 +22,9 @@ const MAX_TEXT_CHARS = 4000;
 // 否则桥接已经判定「发送失败」、重试却还在后台发出去，模型再发一遍就成了重复消息。
 const SEND_TIMEOUT_MS = 8000;
 const MAX_INLINE_RETRY_SEC = 3;
+// 上传图片比发文字慢，单独给 20 秒；桥接那边对上传另包一层 25 秒超时（见 bridge.js 的 sendStickerV2）。
+// 上传被限流时不原地重试：重试会让总耗时超过外层超时。
+const UPLOAD_TIMEOUT_MS = 20000;
 
 /** `tg<chat_id>` 形式的会话 id。 */
 export function tgConvId(chatId) {
@@ -186,7 +189,8 @@ export async function telegramHttp(url, { method = 'GET', json, body: rawBody, c
 
 /**
  * 拼一个 multipart/form-data 请求体：普通字段 + 一个文件。
- * 字段名和文件名都是代码里写死的，不接收外部输入，所以不用转义。
+ * 字段名、文件名、Content-Type 都是代码里写死的；字段值（如 caption 里的用户名）来自外部，
+ * 但只出现在各段正文里，边界是 12 字节随机数，值里伪造不出新的段。
  */
 export function buildMultipart(fields, file) {
   const boundary = `----qqbridge${crypto.randomBytes(12).toString('hex')}`;
@@ -205,7 +209,6 @@ export function buildMultipart(fields, file) {
 const IMAGE_MIME = { gif: 'image/gif', png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
 // Bot API：上传的照片最大 10 MB，动图（sendAnimation）最大 50 MB
 const MAX_PHOTO_UPLOAD = 10 * 1024 * 1024;
-const UPLOAD_TIMEOUT_MS = 30000;
 
 export class TelegramApiError extends Error {
   constructor(message, code, retryAfter) {
@@ -249,7 +252,8 @@ export class TelegramClient {
     const code = body?.error_code ?? res.status;
     const retryAfter = Number(body?.parameters?.retry_after) || 0;
     // 发太快被限流：等得不久就原地重试一次，等得久就交给调用方处理。
-    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= (method.startsWith('send') ? MAX_INLINE_RETRY_SEC : 15)) {
+    const inlineRetryLimit = file ? 0 : (method.startsWith('send') ? MAX_INLINE_RETRY_SEC : 15);
+    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= inlineRetryLimit) {
       await sleep(retryAfter * 1000);
       return this.call(method, params, { timeoutMs, signal, retried: true, file });
     }

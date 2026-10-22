@@ -1933,6 +1933,8 @@ async function main() {
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
     const onTelegram = parseConvKey(key)?.telegram === true;
+    // Telegram：先确认连着、@ 的对象合法，再去下载表情、占发送队列
+    if (onTelegram) telegramTarget(key.slice(key.indexOf(':') + 1), options.atUserId);
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
@@ -1984,11 +1986,12 @@ async function main() {
         await sleep(randInt(800, 2000));
         assertSendAllowed();
         if (onTelegram) {
-          const sent = await telegramSendImage(id, image.buffer, {
+          // 上传另包一层超时（略大于客户端的 20 秒），一张大图卡住时别把 Telegram 的发送队列占太久
+          const sent = await withTimeout(telegramSendImage(id, image.buffer, {
             replyTo: segments[0]?.type === 'reply' ? Number(segments[0].data.id) : null,
             atUserId,
             label: `[表情包:${entry.desc || entry.localNote || entry.id}]`
-          });
+          }), 25000, `Telegram发图 ${key}`);
           sendResolve({ message_id: sent?.message_id ?? null });
           return;
         }
@@ -2472,8 +2475,8 @@ async function main() {
     let mention = null;
     if (atUserId !== null && atUserId !== undefined && String(atUserId).trim() !== '') {
       const raw = String(atUserId).trim();
-      const uid = tgChatIdOf(raw) ?? (/^[1-9]\d*$/.test(raw) ? Number(raw) : null);
-      if (uid === null || uid <= 0) throw new Error('atUserId 必须是 Telegram 用户 id（消息里的 tg 开头那串）');
+      const uid = tgChatIdOf(raw);
+      if (uid === null || uid <= 0) throw new Error('atUserId 必须是 Telegram 用户 id（消息里 tg 开头的那串，如 tg123456789）');
       mention = { userId: uid, name: tg.cache.nameOf(chatId, tgConvId(uid)) || 'TA' };
     }
     const threadId = chatId < 0 ? tg.cache.threadOf(chatId) : null;
@@ -5933,6 +5936,10 @@ async function main() {
             return;
           }
           if (kind === 'private' && atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
+          if (keyMatch.telegram) {
+            // 在占用发送额度之前就把 Telegram 没连上 / @ 对象不合法挡回去
+            try { telegramTarget(id, atUserId); } catch (error) { sendJson({ ok: false, error: error?.message ?? String(error) }, 400); return; }
+          }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
             sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
