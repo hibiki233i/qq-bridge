@@ -16,6 +16,10 @@ const DEFAULT_API_BASE = 'https://api.telegram.org';
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 // Telegram 单条消息上限 4096 个字符；留一点余量。
 const MAX_TEXT_CHARS = 4000;
+// 发送的单次请求超时，以及被限流时原地重试愿意等的最长时间。两者加起来要小于桥接的发送超时（15 秒），
+// 否则桥接已经判定「发送失败」、重试却还在后台发出去，模型再发一遍就成了重复消息。
+const SEND_TIMEOUT_MS = 8000;
+const MAX_INLINE_RETRY_SEC = 3;
 
 /** `tg<chat_id>` 形式的会话 id。 */
 export function tgConvId(chatId) {
@@ -63,9 +67,11 @@ export function normalizeTelegramConfig(raw) {
   const t = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const ownerRaw = t.ownerId;
   let ownerId = null;
+  let invalidOwnerId = '';
+  // 写错了不抛错：抛错会让整个桥接起不来，连 QQ 一起停。只记下来，由 telegramConfigProblems 拦住 Telegram。
   if (ownerRaw !== undefined && ownerRaw !== null && String(ownerRaw).trim() !== '') {
     ownerId = toTgId(ownerRaw, { allowNegative: false });
-    if (ownerId === null) throw new Error('telegram.ownerId 必须是 Telegram 用户 id（正整数）');
+    if (ownerId === null) invalidOwnerId = String(ownerRaw).trim().slice(0, 40);
   }
   const pollTimeoutSec = Math.min(50, Math.max(1, Math.floor(Number(t.pollTimeoutSec) || 30)));
   return {
@@ -74,6 +80,7 @@ export function normalizeTelegramConfig(raw) {
     proxy: String(t.proxy ?? '').trim(),
     apiBase: String(t.apiBase || DEFAULT_API_BASE).trim().replace(/\/+$/, ''),
     ownerId,
+    invalidOwnerId,
     allow: {
       private: normalizeTgIdList(t.allow?.private, { allowNegative: false }),
       groups: normalizeTgIdList(t.allow?.groups, { allowNegative: true })
@@ -85,6 +92,7 @@ export function normalizeTelegramConfig(raw) {
 /** 启动前的配置检查：返回问题列表（空 = 可以启动）。 */
 export function telegramConfigProblems(tcfg) {
   const problems = [];
+  if (tcfg.invalidOwnerId) problems.push(`telegram.ownerId「${tcfg.invalidOwnerId}」不是 Telegram 用户 id（正整数）`);
   if (!BOT_TOKEN_RE.test(tcfg.botToken)) problems.push('telegram.botToken 为空或格式不对（应形如 123456789:AA…，找 @BotFather 要）');
   for (const [label, value] of [['telegram.proxy', tcfg.proxy], ['telegram.apiBase', tcfg.apiBase]]) {
     if (!value && label === 'telegram.proxy') continue;
@@ -213,7 +221,7 @@ export class TelegramClient {
     const code = body?.error_code ?? res.status;
     const retryAfter = Number(body?.parameters?.retry_after) || 0;
     // 发太快被限流：等得不久就原地重试一次，等得久就交给调用方处理。
-    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= 15) {
+    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= (method === 'sendMessage' ? MAX_INLINE_RETRY_SEC : 15)) {
       await sleep(retryAfter * 1000);
       return this.call(method, params, { timeoutMs, signal, retried: true });
     }
@@ -237,7 +245,7 @@ export class TelegramClient {
    * 发一条纯文字（不开 parse_mode：AI 的回复里随便一个 * 或 _ 都可能让 Markdown 解析失败）。
    * 超过上限时按上限切成多条。返回最后一条消息对象。
    */
-  async sendText(chatId, text, { replyTo = null, mention = null } = {}) {
+  async sendText(chatId, text, { replyTo = null, mention = null, threadId = null } = {}) {
     let body = String(text ?? '');
     const entities = [];
     if (mention && mention.userId && mention.name) {
@@ -246,14 +254,23 @@ export class TelegramClient {
       entities.push({ type: 'text_mention', offset: 0, length: name.length, user: { id: Number(mention.userId) } });
     }
     const parts = [];
-    for (let i = 0; i < body.length; i += MAX_TEXT_CHARS) parts.push(body.slice(i, i + MAX_TEXT_CHARS));
+    for (let i = 0; i < body.length;) {
+      let end = Math.min(body.length, i + MAX_TEXT_CHARS);
+      // 别把 emoji 这类代理对从中间切开
+      const c = body.charCodeAt(end - 1);
+      if (end < body.length && c >= 0xd800 && c <= 0xdbff) end -= 1;
+      parts.push(body.slice(i, end));
+      i = end;
+    }
     if (parts.length === 0) parts.push('');
     let last = null;
     for (let i = 0; i < parts.length; i++) {
       const params = { chat_id: chatId, text: parts[i] };
       if (i === 0 && entities.length) params.entities = entities;
       if (i === 0 && replyTo) params.reply_parameters = { message_id: Number(replyTo), allow_sending_without_reply: true };
-      last = await this.call('sendMessage', params);
+      // 话题群（Topics）：不指定就会落到 General
+      if (threadId) params.message_thread_id = Number(threadId);
+      last = await this.call('sendMessage', params, { timeoutMs: SEND_TIMEOUT_MS });
     }
     return last;
   }
@@ -291,6 +308,7 @@ export class TelegramClient {
 export function createTelegramMessageCache(limit = 3000) {
   const messages = new Map(); // `${chatId}:${messageId}` -> { userId, sender, text }
   const names = new Map();    // `${chatId}:${userId}` -> name
+  const threads = new Map();  // chatId -> 最近一条消息所在的话题 id（话题群用）
   const trim = (map) => {
     while (map.size > limit) {
       const oldest = map.keys().next().value;
@@ -308,6 +326,14 @@ export function createTelegramMessageCache(limit = 3000) {
     },
     nameOf(chatId, userId) {
       return names.get(`${chatId}:${userId}`) ?? null;
+    },
+    rememberThread(chatId, threadId) {
+      threads.delete(String(chatId));
+      if (threadId) threads.set(String(chatId), Number(threadId));
+      trim(threads);
+    },
+    threadOf(chatId) {
+      return threads.get(String(chatId)) ?? null;
     },
     remember(chatId, messageId, entry) {
       if (messageId == null) return;
@@ -348,7 +374,8 @@ function mediaSegments(msg, maxBytes) {
     const pick = (fits.length ? fits : msg.photo)[(fits.length ? fits : msg.photo).length - 1];
     segs.push({ type: 'image', data: { file: `tgfile:${pick.file_id}`, url: '' } });
   }
-  if (msg.document) {
+  // GIF 动图会同时带 animation 和 document 两个字段，只按动图算一次
+  if (msg.document && !msg.animation) {
     const d = msg.document;
     if (IMAGE_MIME_RE.test(String(d.mime_type ?? ''))) {
       segs.push({ type: 'image', data: { file: `tgfile:${d.file_id}`, url: '' } });
@@ -401,8 +428,8 @@ function textSegments(text, entities, ctx) {
 export function messagePlainText(msg) {
   const body = String(msg?.text ?? msg?.caption ?? '');
   const tags = [];
-  if (msg?.photo || (msg?.document && IMAGE_MIME_RE.test(String(msg.document.mime_type ?? '')))) tags.push('[图片]');
-  else if (msg?.document) tags.push('[文件]');
+  if (msg?.photo || (msg?.document && !msg?.animation && IMAGE_MIME_RE.test(String(msg.document.mime_type ?? '')))) tags.push('[图片]');
+  else if (msg?.document && !msg?.animation) tags.push('[文件]');
   if (msg?.sticker) tags.push(`[贴纸${msg.sticker.emoji ? `:${msg.sticker.emoji}` : ''}]`);
   if (msg?.voice || msg?.audio) tags.push('[语音]');
   if (msg?.video || msg?.animation || msg?.video_note) tags.push('[视频]');
@@ -463,7 +490,9 @@ export function updateToEvent(update, me, opts = {}) {
     : entities;
 
   const segments = [];
-  const reply = msg.reply_to_message;
+  // 话题群里每条消息都自动「回复」话题的创建消息，那不是真的引用
+  const reply = msg.reply_to_message?.forum_topic_created ? null : msg.reply_to_message;
+  if (kind === 'group') cache?.rememberThread(chatId, msg.is_topic_message ? msg.message_thread_id : null);
   if (reply && reply.message_id != null) {
     segments.push({ type: 'reply', data: { id: String(reply.message_id) } });
     const rs = senderOf(reply);

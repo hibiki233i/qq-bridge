@@ -133,6 +133,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
     tg, telegramSend, onebotSend, sendBurstToQQ, resolveReplyInfo, isOwnerUserId, isSessionAllowedInCurrentMode,
+    isDirectAddress, evaluateWakeTriggerV2,
     getMode() { return currentMode; },
     setSelfIdentity(display, id) {
       selfDisplayName = String(display ?? '');

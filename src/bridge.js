@@ -2463,7 +2463,8 @@ async function main() {
       if (uid === null || uid <= 0) throw new Error('atUserId 必须是 Telegram 用户 id（消息里的 tg 开头那串）');
       mention = { userId: uid, name: tg.cache.nameOf(chatId, tgConvId(uid)) || 'TA' };
     }
-    const sent = await tg.client.sendText(chatId, message, { replyTo, mention });
+    const threadId = chatId < 0 ? tg.cache.threadOf(chatId) : null;
+    const sent = await tg.client.sendText(chatId, message, { replyTo, mention, threadId });
     if (sent?.message_id != null) {
       tg.cache.remember(chatId, sent.message_id, {
         userId: tgConvId(tg.me.id),
@@ -7267,6 +7268,14 @@ async function main() {
 
   // QQ 发送队列（顺序发送 + 间隔，避免触发频率限制）
   let sendChain = Promise.resolve();
+  // Telegram 单独一条队列：Telegram 走代理、可能被限流，慢了也不能把 QQ 的回复堵在后面。
+  let tgSendChain = Promise.resolve();
+  const sendChainFor = (id) => (isTelegramConvId(id) ? tgSendChain : sendChain);
+  function setSendChainFor(id, chain) {
+    if (isTelegramConvId(id)) tgSendChain = chain;
+    else sendChain = chain;
+    return chain;
+  }
   function redactKnownTokensOnly(text) {
     let s = String(text ?? '');
     for (const token of KNOWN_AGENT_TOKENS) {
@@ -7284,10 +7293,11 @@ async function main() {
     const assertSendAllowed = captureSendGuard(key);
     const safeMsg = redactKnownTokensOnly(msg);
     const [kind, id] = key.split(':');
+    let chain = sendChainFor(id);
     const parts = splitForQQ(safeMsg);
     lastSendFailed.delete(key);
     for (const part of parts) {
-      sendChain = sendChain
+      chain = chain
         .then(async () => {
           assertSendAllowed();
           if (isTelegramConvId(id)) await withTimeout(telegramSend(id, part), SEND_TIMEOUT_MS, `Telegram发送 ${kind}:${id}`);
@@ -7300,7 +7310,7 @@ async function main() {
         })
         .then(() => sleep(cfg.sendDelayMs));
     }
-    return sendChain;
+    return setSendChainFor(id, chain);
   }
 
   /** 上一批发往该会话的消息是否全部成功。 */
@@ -7463,6 +7473,7 @@ async function main() {
   function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
+    let chain = sendChainFor(id);
     let min, max, longProb = 0, longMin = 0, longMax = 0;
     if (typeof socialCfgOrMin === 'object' && socialCfgOrMin !== null) {
       const cfg = socialCfgOrMin;
@@ -7480,7 +7491,7 @@ async function main() {
     for (let i = 0; i < messages.length; i++) {
       const msg = redactKnownTokensOnly(messages[i]);
       const isLast = i === messages.length - 1;
-      sendChain = sendChain
+      chain = chain
         .then(async () => {
           assertSendAllowed();
           if (isTelegramConvId(id)) await withTimeout(telegramSend(id, msg), SEND_TIMEOUT_MS, `Telegram发送 ${kind}:${id}`);
@@ -7498,10 +7509,11 @@ async function main() {
       if (!isLast) {
         const useLong = longProb > 0 && Math.random() < longProb;
         const delay = useLong ? randInt(longMin, longMax) : randInt(min, max);
-        sendChain = sendChain.then(() => sleep(delay));
+        chain = chain.then(() => sleep(delay));
       }
     }
-    return sendChain.then(() => sent);
+    setSendChainFor(id, chain);
+    return chain.then(() => sent);
   }
 
 
@@ -8021,13 +8033,14 @@ async function main() {
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
+    let chain = sendChainFor(id);
     const sent = [];
     const failed = [];
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       const useReply = i === 0 ? replyToMessageId : null;
       const useAt = i === 0 ? atUserId : null;
-      sendChain = sendChain
+      chain = chain
         .then(async () => {
           assertSendAllowed();
           await onebotSend(kind, id, msg, useReply, useAt);
@@ -8039,10 +8052,11 @@ async function main() {
         });
       if (i < delays.length) {
         const d = delays[i];
-        sendChain = sendChain.then(() => sleep(d));
+        chain = chain.then(() => sleep(d));
       }
     }
-    return sendChain.then(() => {
+    setSendChainFor(id, chain);
+    return chain.then(() => {
       if (failed.length > 0) {
         const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
         err.sent = sent.slice();
@@ -8952,6 +8966,9 @@ async function main() {
     // 文字里的 @ 已被解析成名字时，按 at 段判断（Telegram 的 @bot 就是这样）
     if (selfId && Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === selfId)) return true;
     if (selfNickname && (lower.includes('@' + selfNickname) || lower.includes(selfNickname))) return true;
+    // Telegram 群里大家叫的是 bot 的名字，不是 QQ 昵称
+    const tgName = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim().toLowerCase() : '';
+    if (tgName && lower.includes(tgName)) return true;
     for (const kw of (cfg.social?.mustReplyKeywords ?? [])) {
       if (lower.includes(String(kw).toLowerCase())) return true;
     }
@@ -10086,11 +10103,13 @@ async function main() {
       const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
       if (atSelf || quoteTargetIsSelf) return 'atMention';
     }
-    if (tr.nameMention && selfNickname) {
+    // Telegram 会话按 bot 的名字认，QQ 会话按 QQ 昵称认
+    const nameForWake = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
+    if (tr.nameMention && nameForWake) {
       // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
       // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
       const lower = String(plainContent ?? '').toLowerCase();
-      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) return 'nameMention';
+      if (lower.includes('@' + nameForWake.toLowerCase()) || lower.includes(nameForWake.toLowerCase())) return 'nameMention';
     }
     if (Array.isArray(tr.keywords) && tr.keywords.length) {
       const lower = String(plainContent ?? '').toLowerCase();

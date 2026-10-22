@@ -55,6 +55,9 @@ const apiServer = http.createServer((req, res) => {
       case 'getMe': return reply(200, { ok: true, result: ME });
       case 'getWebhookInfo': return reply(200, { ok: true, result: { url: '' } });
       case 'sendMessage':
+        if (params.text === 'RATE10') {
+          return reply(429, { ok: false, error_code: 429, description: 'Too Many Requests: retry after 10', parameters: { retry_after: 10 } });
+        }
         if (params.text === 'RATE' && botApi.rateLimitOnce) {
           botApi.rateLimitOnce = false;
           return reply(429, { ok: false, error_code: 429, description: 'Too Many Requests: retry after 1', parameters: { retry_after: 1 } });
@@ -104,7 +107,9 @@ await test('配置规范化：id 名单、管理员、默认值', () => {
   assert.equal(c.apiBase, 'https://api.telegram.org');
   assert.equal(c.pollTimeoutSec, 30);
   assert.equal(normalizeTelegramConfig(undefined).enabled, false, '没有 telegram 段 = 不启用');
-  assert.throws(() => normalizeTelegramConfig({ ownerId: '-3' }), /ownerId/);
+  const badOwner = normalizeTelegramConfig({ enabled: true, botToken: BOT_TOKEN, ownerId: '@hao' });
+  assert.equal(badOwner.ownerId, null, 'ownerId 写错不抛错（抛错会连 QQ 一起起不来）');
+  assert.match(telegramConfigProblems(badOwner).join(), /ownerId「@hao」/, '但启用时要拦住 Telegram 并说明原因');
   assert.deepEqual(telegramConfigProblems(c), []);
   assert.match(telegramConfigProblems({ ...c, botToken: 'nope' }).join(), /botToken/);
   assert.match(telegramConfigProblems({ ...c, proxy: 'socks5://127.0.0.1:1080' }).join(), /HTTP 代理/);
@@ -173,6 +178,20 @@ await test('update → 事件：命令去掉 @bot 后缀；发给别的 bot 的�
   assert.equal(updateToEvent({ update_id: 1, edited_message: {} }, ME), null);
 });
 
+await test('update → 事件：话题群不把自动引用当真；GIF 只算一次', () => {
+  const cache = createTelegramMessageCache();
+  const r = updateToEvent(msgUpdate({
+    chat: { ...groupChat, is_forum: true }, from: alice, text: 'hello', is_topic_message: true, message_thread_id: 40,
+    reply_to_message: { message_id: 40, date: NOW, from: alice, forum_topic_created: { name: '闲聊' } }
+  }), ME, { cache, now: NOW * 1000 });
+  assert.deepEqual(r.event.message, [{ type: 'text', data: { text: 'hello' } }], '话题创建消息不是引用');
+  assert.equal(cache.threadOf(-100500), 40, '记下话题 id，回复发回同一个话题');
+  updateToEvent(msgUpdate({ chat: groupChat, from: alice, text: 'general' }), ME, { cache, now: NOW * 1000 });
+  assert.equal(cache.threadOf(-100500), null, '在 General 说话就回到 General');
+  const gif = updateToEvent(msgUpdate({ chat: privChat, from: alice, animation: { file_id: 'g' }, document: { file_id: 'g', file_name: 'x.gif.mp4', mime_type: 'video/mp4' } }), ME, { now: NOW * 1000 });
+  assert.deepEqual(gif.event.message, [{ type: 'video', data: {} }]);
+});
+
 await test('update → 事件：图片挑不超限的最大尺寸；图片文件、静态贴纸、引用', () => {
   const cache = createTelegramMessageCache();
   const r = updateToEvent(msgUpdate({
@@ -208,6 +227,18 @@ await test('发文字：引用、@ 实体、超长切分；429 等一下重试�
   botApi.calls.length = 0;
   await c.sendText(1, 'x'.repeat(8500));
   assert.deepEqual(botApi.calls.filter((x) => x.method === 'sendMessage').map((x) => x.params.text.length), [4000, 4000, 500]);
+  botApi.calls.length = 0;
+  await c.sendText(1, 'x'.repeat(3999) + '😀' + 'y'.repeat(10), { threadId: 40 });
+  const split = botApi.calls.filter((x) => x.method === 'sendMessage');
+  assert.deepEqual(split.map((x) => x.params.text.length), [3999, 12], '不把 emoji 切成两半');
+  assert.ok(split.every((x) => x.params.text.isWellFormed()), '每段都是完整的 UTF-16');
+  assert.equal(split[0].params.message_thread_id, 40, '话题 id 带上');
+  botApi.calls.length = 0;
+  const t1 = Date.now();
+  const longWait = await c.sendText(1, 'RATE10').catch((e) => e);
+  assert.equal(longWait.code, 429);
+  assert.ok(Date.now() - t1 < 2000, '要等很久的限流不原地重试（否则桥接已判失败、重试还在后台发出去）');
+  assert.equal(botApi.calls.filter((x) => x.method === 'sendMessage').length, 1);
   botApi.calls.length = 0;
   const t0 = Date.now();
   await c.sendText(1, 'RATE');
@@ -351,6 +382,43 @@ await test('桥接：一代模式收 Telegram 消息投给 DSH，回复发回 Te
     await h.sendToQQ('private:123', 'qq 这边');
     assert.equal(h.calls.sent.at(-1)?.id, 123, 'QQ 发送照旧');
     assert.equal(calls.filter((c) => c.text).length, 2, 'QQ 消息不能发到 Telegram');
+  } finally { await h.close(); }
+});
+
+await test('桥接：Telegram 卡住时 QQ 照常发送（两条发送队列分开）', async () => {
+  const h = await bridgeHarness({ config: TG_CONFIG });
+  try {
+    fakeTelegram(h);
+    h.tg.client.sendText = () => new Promise(() => {}); // 代理接了连接却不回
+    void h.sendToQQ('private:tg111', '卡住');
+    const t0 = Date.now();
+    await h.sendToQQ('private:123', 'QQ 不受影响');
+    assert.ok(Date.now() - t0 < 2000, `QQ 发送被 Telegram 堵住了 ${Date.now() - t0}ms`);
+    assert.equal(h.calls.sent.at(-1)?.id, 123);
+  } finally { await h.close(); }
+});
+
+await test('桥接：Telegram ownerId 写错不影响桥接启动', async () => {
+  const h = await bridgeHarness({ config: { telegram: { enabled: false, ownerId: '@hao' } } });
+  try {
+    assert.equal(h.cfg.telegram.ownerId, null);
+    assert.equal(h.isOwnerUserId('123'), true, 'QQ 管理员照常');
+  } finally { await h.close(); }
+});
+
+await test('桥接：Telegram 群里叫 bot 的名字能唤醒（不是 QQ 昵称）', async () => {
+  const h = await bridgeHarness({ config: TG_CONFIG });
+  try {
+    fakeTelegram(h);
+    h.setSelfIdentity('QQ昵称', '10001');
+    h.tg.me.first_name = '小樰'; // 不用默认关键词里的词，免得被关键词触发混淆
+    const event = { platform: 'telegram', self_id: 'tg7000', user_id: 'tg222', message: [{ type: 'text', data: { text: '小樰你觉得呢' } }] };
+    assert.equal(h.isDirectAddress('小樰你觉得呢', event, 'group'), true);
+    const st = h.getSocialV2State('group:tg-100500');
+    st.wakeConfig.triggers = { nameMention: true };
+    assert.equal(h.evaluateWakeTriggerV2('group:tg-100500', st, event, 'group', '小樰你觉得呢', '小樰你觉得呢', false), 'nameMention');
+    const qqEvent = { self_id: '10001', user_id: '5', message: [] };
+    assert.equal(h.evaluateWakeTriggerV2('group:456', h.getSocialV2State('group:456'), qqEvent, 'group', '小樰', '小樰', false), null, 'QQ 群仍按 QQ 昵称');
   } finally { await h.close(); }
 });
 
