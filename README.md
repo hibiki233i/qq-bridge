@@ -128,9 +128,10 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 - 名单和 QQ 的分开存；名单为空就谁也不理（不跟随 `allowAllWhenEmpty`）。`ownerId` 的私聊总是放行，也能用 `/reset` 等管理命令；封闭 agent 模式（closed-agent）仍只认 QQ 管理员。
 - 不知道 id：先启用并启动桥接，给 bot 发一句话，日志里「忽略未授权会话 private:tg123…」里 `tg` 后面的数字就是。
 - 支持文字和图片：收图给模型看，发文字、引用、@。拍一拍、语音、合并转发只在 QQ 上有，Telegram 会话调用这些工具会直接返回"不支持"。
-- 贴纸（要配 `ownerId`，并且管理员给 bot 发过消息）：Bot API 读写不了用户的收藏夹，所以 bot 自己建两个挂在管理员名下的贴纸包——
-  - `her_fav_by_<bot>`：她在 Telegram 会话里用 `qq_collect_sticker` 收藏的贴纸 / 图片（`telegram.stickers.favorites`）；
-  - `her_qq_by_<bot>`：QQ 收藏表情自动同步过去（`telegram.stickers.syncQQ`，启动后 15 秒开始、每 30 分钟一轮、一轮最多 20 张，包上限 120 张）。静态图转成 512 像素 PNG，动图 GIF 转成 VP9 WEBM 视频贴纸，需要 ffmpeg（和语音功能共用 `socialV2.voice.ffmpegPath` / `FFMPEG_PATH`）。
+- 贴纸（默认关闭；要配 `ownerId`，并且管理员给 bot 发过消息）：Bot API 读写不了用户的收藏夹，所以 bot 自己建两个挂在管理员名下的贴纸包。**贴纸包是公开的**，知道包名的人都能打开，确认能接受再打开——
+  - `her_fav_<标记>_by_<bot>`：她在 Telegram 会话里用 `qq_collect_sticker` 收藏的贴纸 / 图片（`telegram.stickers.favorites: true`）；
+  - `her_qq_<标记>_by_<bot>`：QQ 收藏表情自动同步过去（`telegram.stickers.syncQQ: true`，启动后 15 秒开始、每 30 分钟一轮、一轮最多尝试 20 张，包上限 120 张；同一张失败 3 次就不再试）。静态图转成 512 像素 PNG，动图 GIF 转成 VP9 WEBM 视频贴纸（超过 3 秒的截掉后面），需要 ffmpeg（和语音功能共用 `socialV2.voice.ffmpegPath` / `FFMPEG_PATH`）；ffmpeg 解不了的格式（有的版本解不了动态 WebP）不会同步。
+  - `<标记>` 由 bot id 和 `ownerId` 哈希出来：换 bot 或换管理员会改用新包，旧记录作废。每轮同步前会和包里的实际内容对账。
   - `qq_send_sticker` 在 Telegram 会话里：`tg:` 开头的 id 发她的收藏；同步过的 QQ 表情发成真贴纸；其余（或要 @ 人时）以图片发出。本地记录在 `state/telegram-stickers.json`。
 - 想让她看到群里所有消息，要在 @BotFather 里 `/setprivacy` → Disable，再把 bot 移出群重新拉进来。
 - 桥接停机期间积压超过 10 分钟的 Telegram 消息，重启后不再回复。

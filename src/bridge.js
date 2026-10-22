@@ -23,7 +23,7 @@ import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, resolveFfmpeg, safeJoinLibrary } from './send-voice-lib.js';
-import { createTgStickerManager, convertToSticker, cleanTgStickerRef } from './tg-stickers.js';
+import { createTgStickerManager, convertToSticker, cleanTgStickerRef, ffmpegAvailable } from './tg-stickers.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { resolveImplSetting, detectImplFromVersion, buildFaceRemarkRequest, sniffImageExt } from './onebot-impl.js';
@@ -1997,8 +1997,9 @@ async function main() {
           try {
             sent = await withTimeout(telegramSendStickerFile(id, stickerFileId, { replyTo, label }), SEND_TIMEOUT_MS, `Telegram发贴纸 ${key}`);
           } catch (error) {
-            // 收藏贴纸没有别的发法；同步过的 QQ 表情（比如贴纸被人从包里删了）退回发图片
-            if (fav) throw error;
+            // 收藏贴纸没有别的发法；同步过的 QQ 表情只在 Telegram 明确拒绝（比如贴纸被人从包里删了）时退回发图片。
+            // 超时 / 网络错误不退回：请求可能已经到了 Telegram，再发一张图就成了两条。
+            if (fav || error?.code !== 400) throw error;
             log(`[tg-sticker] 同步贴纸发送失败，改发图片：${error?.message ?? error}`);
           }
         }
@@ -2657,14 +2658,18 @@ async function main() {
       log('ℹ️  Telegram 贴纸包需要 telegram.ownerId（贴纸包必须挂在一个真人名下）；没配时 QQ 表情在 Telegram 上以图片发出，也不能收藏 Telegram 贴纸');
       return;
     }
+    const ffmpeg = resolveFfmpeg({ ffmpegPath: cfg.socialV2?.voice?.ffmpegPath || null });
+    const hasFfmpeg = ffmpegAvailable(ffmpeg);
+    if (!hasFfmpeg) {
+      log(`⚠️  找不到 ffmpeg：${sc.syncQQ ? 'QQ 表情不会同步成 Telegram 贴纸；' : ''}收藏 Telegram 上的图片也用不了（收藏贴纸不受影响）。装好 ffmpeg 或设置 FFMPEG_PATH 后重启桥接`);
+    }
     try {
-      const ffmpeg = resolveFfmpeg({ ffmpegPath: cfg.socialV2?.voice?.ffmpegPath || null });
       tg.stickers = createTgStickerManager({
         client: tg.client,
         ownerId: cfg.telegram.ownerId,
         me: tg.me,
         storeFile: TG_STICKER_FILE,
-        convert: (buf) => convertToSticker(buf, { ffmpeg }),
+        convert: (buf) => (hasFfmpeg ? convertToSticker(buf, { ffmpeg }) : Promise.reject(new Error('找不到 ffmpeg，图片转不成贴纸'))),
         defaultEmoji: sc.defaultEmoji,
         log
       });
@@ -2672,8 +2677,8 @@ async function main() {
       log(`⚠️  Telegram 贴纸包不可用：${error?.message ?? error}`);
       return;
     }
-    log(`Telegram 贴纸包：收藏 t.me/addstickers/${tg.stickers.names.fav}${sc.syncQQ ? `，QQ 表情 t.me/addstickers/${tg.stickers.names.qq}` : ''}（还没有贴纸时链接打不开）`);
-    if (sc.syncQQ) {
+    log(`Telegram 贴纸包（公开，知道链接的人都能打开）：${sc.favorites ? `收藏 t.me/addstickers/${tg.stickers.names.fav}` : ''}${sc.favorites && sc.syncQQ ? '；' : ''}${sc.syncQQ ? `QQ 表情 t.me/addstickers/${tg.stickers.names.qq}` : ''}（还没有贴纸时链接打不开）`);
+    if (sc.syncQQ && hasFfmpeg) {
       setTimeout(() => { void runQqStickerSync(); }, 15000);
       const timer = setInterval(() => { void runQqStickerSync(); }, 30 * 60 * 1000);
       timer.unref?.();
@@ -2697,7 +2702,7 @@ async function main() {
         return fetched.buffer;
       });
       if (r.added || r.removed || r.failed) {
-        log(`[tg-sticker] QQ 表情同步：新增 ${r.added}，删除 ${r.removed}，失败 ${r.failed}${r.skipped ? `，还有 ${r.skipped} 张下一轮再传` : ''}`);
+        log(`[tg-sticker] QQ 表情同步：新增 ${r.added}，删除 ${r.removed}，失败 ${r.failed}${r.skipped ? `，还有 ${r.skipped} 张下一轮再传` : ''}${r.gaveUp ? `，${r.gaveUp} 张多次失败已放弃` : ''}`);
       }
       if (r.skipped) setTimeout(() => { void runQqStickerSync(); }, 60000);
       return r;
@@ -5919,8 +5924,9 @@ async function main() {
           const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
           const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
           if (stickerId.startsWith('tg:')) {
-            // Telegram 收藏只有一句备注；note / usage 谁有用谁
-            const fav = tg.stickers?.noteFavorite(stickerId, note ?? usage ?? '');
+            // Telegram 收藏只有一句备注；note / usage 谁有用谁。只传了 tags 时别把备注清空
+            if (note === undefined && usage === undefined) { sendJson({ ok: false, error: 'Telegram 收藏只能写备注（note），不支持 tags' }, 400); return; }
+            const fav = tg.stickers?.noteFavorite(stickerId, note ?? usage);
             if (!fav) { sendJson({ ok: false, error: `找不到 Telegram 收藏贴纸 ${stickerId}` }, 404); return; }
             sendJson({ ok: true, key, sticker: fav });
             return;
@@ -10528,7 +10534,8 @@ async function main() {
     return `【你的身份】这是 Telegram 上的会话（不是 QQ），你在这里叫「${name || '（未取到）'}」${handle ? `（${handle}）` : ''}。`
       + `消息里 @ 你${id ? `（at 段里是 ${id}）` : ''}、或引用你的消息，指的都是你。`
       + (tg.stickers
-        ? '这里能发文字和表情包：qq_send_sticker 发你在 Telegram 收藏的贴纸（id 以 tg: 开头）或 QQ 表情（同步过的发成真贴纸，其余发成图片）；看到喜欢的贴纸可以用 qq_collect_sticker 收进你的 Telegram 贴纸包。'
+        ? `这里能发文字和表情包：qq_send_sticker 发${cfg.telegram.stickers?.favorites ? '你在 Telegram 收藏的贴纸（id 以 tg: 开头）或' : ''} QQ 表情（同步过的发成真贴纸，其余发成图片）。`
+          + (cfg.telegram.stickers?.favorites ? '看到喜欢的贴纸可以用 qq_collect_sticker 收进你的 Telegram 贴纸包。' : '')
         : '这里能发文字和表情包（qq_send_sticker 会以图片发出）。')
       + '拍一拍、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
   }

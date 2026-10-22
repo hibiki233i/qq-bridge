@@ -91,10 +91,11 @@ export function normalizeTelegramConfig(raw) {
       groups: normalizeTgIdList(t.allow?.groups, { allowNegative: true })
     },
     pollTimeoutSec,
-    // 贴纸包（要 ownerId）：favorites = 她在 Telegram 上收藏贴纸；syncQQ = 把 QQ 收藏表情同步成贴纸包
+    // 贴纸包（要 ownerId）：favorites = 她在 Telegram 上收藏贴纸；syncQQ = 把 QQ 收藏表情同步成贴纸包。
+    // 贴纸包是公开的（知道包名就能打开），所以默认都关，要管理员明确打开。
     stickers: {
-      favorites: t.stickers?.favorites !== false,
-      syncQQ: t.stickers?.syncQQ !== false,
+      favorites: t.stickers?.favorites === true,
+      syncQQ: t.stickers?.syncQQ === true,
       defaultEmoji: String(t.stickers?.defaultEmoji ?? '🙂').slice(0, 16) || '🙂'
     }
   };

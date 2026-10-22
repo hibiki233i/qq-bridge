@@ -19,7 +19,7 @@ import {
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { toForm, applyForm } from './config-gui.mjs';
 import {
-  stickerSetNames, emojiListFor, keywordsFor, isAnimatedGif, cleanTgStickerRef,
+  stickerSetNames, stickerSetTag, emojiListFor, keywordsFor, isAnimatedGif, cleanTgStickerRef,
   createTgStickerManager, loadTgStickerStore, SET_LIMIT, convertToSticker
 } from '../src/tg-stickers.js';
 import { spawnSync } from 'node:child_process';
@@ -421,6 +421,11 @@ async function withServer(h, run) {
 }
 
 const TG_CONFIG = { telegram: { enabled: true, botToken: BOT_TOKEN, ownerId: 111, allow: { private: [222], groups: [-100500] } } };
+// 打开贴纸包的配置（默认是关的）
+const TG_STICKER_CONFIG = { telegram: { ...TG_CONFIG.telegram, stickers: { favorites: true, syncQQ: true } } };
+const TAG = stickerSetTag(7000, 111);
+const FAV_SET = `her_fav_${TAG}_by_her_bot`;
+const QQ_SET = `her_qq_${TAG}_by_her_bot`;
 function fakeTelegram(h) {
   const calls = [];
   h.tg.client = {
@@ -633,7 +638,7 @@ await test('桥接：二代 send-sticker 接口对 Telegram 会话放行；下�
       assert.match(bad.json.error, /不是图片/);
       const collect = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messageId: '1' } });
       assert.equal(collect.status, 500);
-      assert.match(collect.json.error, /ownerId|没准备好/, '没有贴纸包时说清楚要先配 ownerId');
+      assert.match(collect.json.error, /收藏贴纸已关闭/, '默认关着，说清楚是关着的');
     });
     const prompt = h.buildWakePromptV2('private:tg222', 'private');
     assert.match(prompt, /qq_send_sticker 会以图片发出/);
@@ -662,7 +667,7 @@ await test('配置页：Telegram 字段读写与校验', () => {
   assert.ok(!r.errors, JSON.stringify(r.errors));
   assert.deepEqual(r.file.telegram, {
     enabled: true, apiBase: 'http://mirror', pollTimeoutSec: 20, botToken: BOT_TOKEN, proxy: 'http://127.0.0.1:7890',
-    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, stickers: { favorites: true, syncQQ: true }
+    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, stickers: { favorites: false, syncQQ: false }
   }, '其余 telegram 字段保留，名单去重存数字');
   const off = applyForm({ ...file, telegram: { ...file.telegram, stickers: { defaultEmoji: '😺' } } },
     { ...f, telegram: { ...f.telegram, botToken: BOT_TOKEN, stickerFavorites: false, stickerSyncQQ: false } });
@@ -710,9 +715,17 @@ await test('配置页：测试连接（通过代理访问 Bot API）', async () 
 
 // ── 6. 贴纸包（B：Telegram 收藏；C：QQ 表情同步）──────────────────────────
 await test('贴纸包：包名、emoji、关键词、动图判断、贴纸引用清洗', () => {
-  assert.deepEqual(stickerSetNames('her_bot'), { fav: 'her_fav_by_her_bot', qq: 'her_qq_by_her_bot' });
-  assert.throws(() => stickerSetNames('bad__name'));
-  assert.throws(() => stickerSetNames(''));
+  assert.match(TAG, /^[0-9a-f]{6}$/);
+  assert.notEqual(stickerSetTag(7000, 112), TAG, '换管理员包名就变');
+  assert.notEqual(stickerSetTag(7001, 111), TAG, '换 bot 包名就变');
+  assert.ok(!TAG.includes('111') || TAG !== '111', '包名里不直接出现管理员 id');
+  assert.deepEqual(stickerSetNames('her_bot', TAG), { fav: FAV_SET, qq: QQ_SET });
+  assert.throws(() => stickerSetNames('bad__name', TAG));
+  assert.throws(() => stickerSetNames('', TAG));
+  assert.throws(() => stickerSetNames('her_bot', 'zz'));
+  assert.deepEqual(emojiListFor(['©好 ‼']), ['©\uFE0F', '‼\uFE0F'], '文字样式的符号补上 FE0F');
+  const tgDefaults = normalizeTelegramConfig({ enabled: true });
+  assert.deepEqual({ ...tgDefaults.stickers, defaultEmoji: undefined }, { favorites: false, syncQQ: false, defaultEmoji: undefined }, '贴纸包是公开的，默认都关');
   assert.deepEqual(emojiListFor(['好耶🎉 冲', '😀'], '🙂'), ['🎉', '😀']);
   assert.deepEqual(emojiListFor(['没有表情'], 'x'), ['🙂'], '默认 emoji 不是 emoji 时退回 🙂');
   assert.deepEqual(emojiListFor([''], '😺'), ['😺']);
@@ -754,9 +767,10 @@ function stickerManager(storeFile, extra = {}) {
   const m = createTgStickerManager({
     client: new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE }),
     ownerId: 111,
-    me: { username: 'her_bot', first_name: '小鲸鱼' },
+    me: { id: 7000, username: 'her_bot', first_name: '小鲸鱼' },
     storeFile,
     convert: async (buf) => { converted.push(buf); return { buffer: PNG, format: 'static' }; },
+    gapMs: 0,
     ...extra
   });
   return { m, converted };
@@ -772,7 +786,7 @@ await test('B：收藏贴纸用原 file_id 进包（不重新上传），第一�
     assert.equal(converted.length, 0, '贴纸不用转换');
     assert.ok(!botApi.calls.some((c) => c.method === 'uploadStickerFile'), '不用重新上传');
     const create = botApi.calls.find((c) => c.method === 'createNewStickerSet');
-    assert.equal(create.params.name, 'her_fav_by_her_bot');
+    assert.equal(create.params.name, FAV_SET);
     assert.equal(create.params.user_id, 111, '挂在管理员名下');
     assert.equal(create.params.title, '小鲸鱼 的收藏');
     assert.deepEqual(create.params.stickers[0], { sticker: 'CAACAgIAAxkBAAE1', format: 'video', emoji_list: ['😹'], keywords: ['笑死', '哈哈'] });
@@ -794,7 +808,7 @@ await test('B：收藏贴纸用原 file_id 进包（不重新上传），第一�
     // 记录落盘，重启后还在
     const reloaded = loadTgStickerStore(path.join(tmp, 'tg.json'));
     assert.equal(reloaded.favorites.length, 2);
-    assert.equal(reloaded.sets.fav.name, 'her_fav_by_her_bot');
+    assert.equal(reloaded.sets.fav.name, FAV_SET);
     assert.equal((fs.statSync(path.join(tmp, 'tg.json')).mode & 0o777), 0o600);
     // 包被人在客户端删掉后，下次收藏会重建
     botApi.sets.clear();
@@ -805,7 +819,7 @@ await test('B：收藏贴纸用原 file_id 进包（不重新上传），第一�
 
 await test('B：包满 120 张时拒绝并说清楚', async () => {
   botApi.sets.clear();
-  botApi.sets.set('her_fav_by_her_bot', { name: 'her_fav_by_her_bot', title: 'x', stickers: Array.from({ length: SET_LIMIT }, (_, i) => ({ file_id: `F${i}xxxxxxxxxx`, file_unique_id: `U${i}` })) });
+  botApi.sets.set(FAV_SET, { name: FAV_SET, title: 'x', stickers: Array.from({ length: SET_LIMIT }, (_, i) => ({ file_id: `F${i}xxxxxxxxxx`, file_unique_id: `U${i}` })) });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-stk-'));
   try {
     const { m } = stickerManager(path.join(tmp, 'tg.json'));
@@ -823,37 +837,78 @@ await test('C：QQ 表情同步——新增转换上传、QQ 里删掉的从包�
     const downloads = [];
     const dl = async (e) => { downloads.push(e.md5); return GIF; };
     const lib = [{ md5: md5(1), desc: '开心😄', useCount: 1 }, { md5: md5(2), desc: '', useCount: 9 }, { md5: md5(3), localNote: '无语', useCount: 5 }, { md5: '', desc: '没 md5 的跳过' }];
-    const r1 = await m.syncQq(lib, dl, { maxAdds: 2, gapMs: 0 });
-    assert.deepEqual(r1, { added: 2, removed: 0, failed: 0, skipped: 1 });
+    const r1 = await m.syncQq(lib, dl, { maxAdds: 2 });
+    assert.deepEqual(r1, { added: 2, removed: 0, failed: 0, skipped: 1, gaveUp: 0 });
     assert.deepEqual(downloads, [md5(2), md5(3)], '用得多的先同步');
     assert.equal(converted.length, 2);
     const create = botApi.calls.find((c) => c.method === 'createNewStickerSet');
-    assert.equal(create.params.name, 'her_qq_by_her_bot');
+    assert.equal(create.params.name, QQ_SET);
     assert.equal(create.params.title, '小鲸鱼 的 QQ 表情');
-    const r2 = await m.syncQq(lib, dl, { maxAdds: 5, gapMs: 0 });
+    const r2 = await m.syncQq(lib, dl, { maxAdds: 5 });
     assert.equal(r2.added, 1, '第二轮补上剩下的');
     assert.ok(m.qqFileIdFor(md5(1).toLowerCase()), 'md5 大小写不敏感');
     const add = botApi.calls.filter((c) => c.method === 'addStickerToSet').at(-1);
     assert.deepEqual(add.params.sticker.emoji_list, ['😄'], '备注里的 emoji 当贴纸 emoji');
     // QQ 里删掉了一张
-    const r3 = await m.syncQq(lib.filter((e) => e.md5 !== md5(3)), dl, { gapMs: 0 });
+    const r3 = await m.syncQq(lib.filter((e) => e.md5 !== md5(3)), dl);
     assert.equal(r3.removed, 1);
     assert.equal(m.qqFileIdFor(md5(3)), null);
-    assert.equal(botApi.sets.get('her_qq_by_her_bot').stickers.length, 2);
-    // 包里那张被人手动删了：删除时报 STICKER_INVALID 也当作删掉
-    botApi.sets.get('her_qq_by_her_bot').stickers.length = 0;
-    const r4 = await m.syncQq([], dl, { gapMs: 0 });
-    assert.equal(r4.removed, 2);
-    // 下载 / 转换失败只记失败，不中断
-    const r5 = await m.syncQq([{ md5: md5(7) }], async () => { throw new Error('CDN 挂了'); }, { gapMs: 0 });
-    assert.deepEqual(r5, { added: 0, removed: 0, failed: 1, skipped: 0 });
+    assert.equal(botApi.sets.get(QQ_SET).stickers.length, 2);
+    // 一张能认的都没有（网关没连上 / 条目缺 md5）：不动包
+    const r4 = await m.syncQq([{ md5: '' }], dl);
+    assert.deepEqual(r4, { added: 0, removed: 0, failed: 0, skipped: 0, gaveUp: 0 });
+    assert.equal(botApi.sets.get(QQ_SET).stickers.length, 2, '空列表不能被当成全删了');
+    // 包里的贴纸被人手动删了：对账时忘掉，重新上传
+    botApi.sets.get(QQ_SET).stickers.length = 0;
+    const r5 = await m.syncQq(lib.filter((e) => e.md5 !== md5(3)), dl);
+    assert.equal(r5.added, 2, '手动删掉的重新传上去');
+    // 包里多出一张本地没记录的（比如加完读包失败）：对账时删掉
+    botApi.sets.get(QQ_SET).stickers.push({ file_id: 'STRAYxxxxxxxxxx', file_unique_id: 'STRAY1' });
+    await m.syncQq(lib.filter((e) => e.md5 !== md5(3)), dl);
+    assert.ok(!botApi.sets.get(QQ_SET).stickers.some((x) => x.file_unique_id === 'STRAY1'), '没记录的被清掉了');
+    assert.equal(botApi.sets.get(QQ_SET).stickers.length, 2);
+    // 同一张连续失败 3 次就不再重试
+    const failing = [{ md5: md5(7) }];
+    let tries = 0;
+    const bad = async () => { tries += 1; throw new Error('解不了这种图'); };
+    for (let i = 0; i < 3; i++) assert.equal((await m.syncQq(failing, bad)).failed, 1);
+    const r6 = await m.syncQq(failing, bad);
+    assert.equal(tries, 3, '第 4 轮不再尝试');
+    assert.equal(r6.gaveUp, 1);
+    assert.match(m.store.qqFailed[md5(7)].reason, /解不了/);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+await test('B：收藏包里有本地没记录的贴纸（比如记录丢了）时补记成收藏，不删', async () => {
+  botApi.sets.clear();
+  botApi.sets.set(FAV_SET, { name: FAV_SET, title: 'x', stickers: [{ file_id: 'OLDFAVxxxxxxxxx', file_unique_id: 'OLD1', emoji: '😺', is_animated: false, is_video: false }] });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-stk-'));
+  try {
+    const { m } = stickerManager(path.join(tmp, 'tg.json'));
+    await m.collect({ sticker: { fileId: 'CAACAgIAAxkBAAE8', fileUniqueId: 'AgAD08', format: 'static' } }, '');
+    assert.deepEqual(m.favorites().map((f) => f.fileUniqueId).sort(), ['OLD1', botApi.sets.get(FAV_SET).stickers[1].file_unique_id].sort());
+    assert.equal(botApi.sets.get(FAV_SET).stickers.length, 2);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+await test('换了 bot 或管理员：旧记录作废，用新包名', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-stk-'));
+  try {
+    const file = path.join(tmp, 'tg.json');
+    fs.writeFileSync(file, JSON.stringify({ binding: 'abcdef', favorites: [{ fileId: 'OLDFAVxxxxxxxxx', fileUniqueId: 'OLD1' }], qq: { ['A'.repeat(32)]: { fileId: 'OLDQQxxxxxxxxxx' } } }));
+    const logs = [];
+    const { m } = stickerManager(file, { log: (...a) => logs.push(a.join(' ')) });
+    assert.equal(m.favorites().length, 0);
+    assert.equal(m.qqFileIdFor('A'.repeat(32)), null);
+    assert.equal(loadTgStickerStore(file).binding, TAG);
+    assert.match(logs.join(), /bot 或 ownerId 变了/);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
 await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → 用 tg: id 发出真贴纸', async () => {
   botApi.sets.clear();
   botApi.calls.length = 0;
-  const h = await bridgeHarness({ config: TG_CONFIG });
+  const h = await bridgeHarness({ config: TG_STICKER_CONFIG });
   try {
     h.tg.client = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
     h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
@@ -873,7 +928,7 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
       const collect = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111', messageId: '31', remark: '猫猫' } });
       assert.equal(collect.status, 200, collect.body);
       assert.match(collect.json.emojiId, /^tg:/);
-      assert.equal(botApi.sets.get('her_fav_by_her_bot').stickers[0].source, 'CAACAgIAAxkBAAE5');
+      assert.equal(botApi.sets.get(FAV_SET).stickers[0].source, 'CAACAgIAAxkBAAE5');
       const list = await consoleCall(port, '/api/socialV2/sticker-list', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111' } });
       assert.equal(list.status, 200, list.body);
       assert.equal(list.json.telegramFavorites.length, 1);
@@ -881,6 +936,9 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
       const favId = list.json.telegramFavorites[0].id;
       const note = await consoleCall(port, '/api/socialV2/sticker-note', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111', stickerId: favId, note: '猫猫叹气' } });
       assert.equal(note.status, 200, note.body);
+      const tagsOnly = await consoleCall(port, '/api/socialV2/sticker-note', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111', stickerId: favId, tags: ['猫'] } });
+      assert.equal(tagsOnly.status, 400, '只传 tags 时不能把备注清空');
+      assert.equal(h.tg.stickers.findFavorite(favId).note, '猫猫叹气');
       const img = await consoleCall(port, `/api/socialV2/sticker-image?key=private%3Atg111&stickerId=${encodeURIComponent(favId)}`, { token: st.agentToken });
       assert.equal(img.status, 200, img.body);
       assert.equal(img.json.image.mimeType, 'image/png', '动态贴纸看缩略图');
@@ -888,7 +946,7 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
       const send = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111', stickerId: favId, replyToMessageId: 31 } });
       assert.equal(send.status, 200, send.body);
       const call = botApi.calls.find((c) => c.method === 'sendSticker');
-      assert.equal(call.params.sticker, botApi.sets.get('her_fav_by_her_bot').stickers[0].file_id, '发的是包里那张');
+      assert.equal(call.params.sticker, botApi.sets.get(FAV_SET).stickers[0].file_id, '发的是包里那张');
       assert.equal(call.params.reply_parameters.message_id, 31);
       assert.ok(!botApi.calls.some((c) => c.method === 'sendPhoto'), '不是发图片');
       const withAt = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: h.getSocialV2State('group:tg-100500').agentToken, body: { key: 'group:tg-100500', stickerId: favId, atUserId: 'tg222' } });
@@ -907,7 +965,7 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
 
 await test('桥接：同步过的 QQ 表情发成真贴纸；贴纸发送失败退回发图；QQ 表情库为空时不动贴纸包', async () => {
   const qqHttp = [];
-  const h = await bridgeHarness({ config: TG_CONFIG, globals: {
+  const h = await bridgeHarness({ config: TG_STICKER_CONFIG, globals: {
     safeFetchBuffer: async () => ({ buffer: GIF }),
     fetch: async (url) => { qqHttp.push(String(url)); return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { message_id: 1 } }) }; }
   } });
@@ -916,7 +974,8 @@ await test('桥接：同步过的 QQ 表情发成真贴纸；贴纸发送失败�
     h.tg.client.sendImage = async (chatId, buffer, opts) => { calls.push({ image: true, chatId }); return { message_id: 801 }; };
     let stickerFails = false;
     h.tg.client.sendSticker = async (chatId, fileId, opts) => {
-      if (stickerFails) throw new Error('Telegram sendSticker 失败：Bad Request: wrong file identifier');
+      if (stickerFails === 'timeout') throw new Error('Telegram sendSticker 网络错误：请求超时（8000ms）');
+      if (stickerFails) throw Object.assign(new Error('Telegram sendSticker 失败：Bad Request: wrong file identifier'), { code: 400 });
       calls.push({ sticker: fileId, chatId, opts }); return { message_id: 802 };
     };
     h.tg.stickers = { qqFileIdFor: () => 'SYNCEDFILExxxxxxx', favorites: () => [], findFavorite: () => null, syncQq: async () => { throw new Error('不该被调用'); } };
@@ -926,7 +985,11 @@ await test('桥接：同步过的 QQ 表情发成真贴纸；贴纸发送失败�
     assert.equal(calls.filter((c) => c.image).length, 0);
     stickerFails = true;
     const fallback = await h.sendStickerV2('private:tg222', 'fixture-sticker');
-    assert.equal(fallback.messageId, 801, '贴纸发不出去就发图片');
+    assert.equal(fallback.messageId, 801, 'Telegram 明确拒绝贴纸时改发图片');
+    stickerFails = 'timeout';
+    const imagesBefore = calls.filter((c) => c.image).length;
+    await assert.rejects(h.sendStickerV2('private:tg222', 'fixture-sticker'), /超时/);
+    assert.equal(calls.filter((c) => c.image).length, imagesBefore, '超时不改发图片（贴纸可能已经到了，再发就成两条）');
     // 要 @ 人时贴纸带不了说明，直接发图片
     stickerFails = false;
     await h.sendStickerV2('group:tg-100500', 'fixture-sticker', { atUserId: 'tg222' });
@@ -938,8 +1001,18 @@ await test('桥接：同步过的 QQ 表情发成真贴纸；贴纸发送失败�
   } finally { await h.close(); }
 });
 
+await test('桥接：贴纸包默认关闭（公开的），不打开就不建', async () => {
+  const h = await bridgeHarness({ config: TG_CONFIG });
+  try {
+    fakeTelegram(h);
+    h.setupTelegramStickers();
+    assert.equal(h.tg.stickers, null);
+    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), '没开收藏就不提收藏');
+  } finally { await h.close(); }
+});
+
 await test('桥接：没配 ownerId 时不建贴纸包，表情照样以图片发', async () => {
-  const h = await bridgeHarness({ config: { telegram: { ...TG_CONFIG.telegram, ownerId: null } } });
+  const h = await bridgeHarness({ config: { telegram: { ...TG_STICKER_CONFIG.telegram, ownerId: null } } });
   try {
     fakeTelegram(h);
     h.setupTelegramStickers();

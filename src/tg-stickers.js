@@ -7,6 +7,9 @@
 // 唯一办法是自己建包（createNewStickerSet / addStickerToSet）。包名必须以 _by_<bot 用户名> 结尾，
 // 必须挂在一个真人用户名下（这里用 telegram.ownerId），一个包最多 120 张。
 //
+// ⚠️ 贴纸包是公开的：知道包名的人都能打开 t.me/addstickers/<包名>。所以两个功能默认都关着，
+// 要管理员在配置里明确打开（telegram.stickers.favorites / syncQQ）。
+//
 // 自己上传的贴纸有规格要求（https://core.telegram.org/stickers）：
 //   静态：PNG/WEBP，一边正好 512 像素、另一边不超过 512
 //   视频：WEBM（VP9），一边 512，≤ 3 秒，≤ 30 fps，≤ 256 KB，无音轨
@@ -15,27 +18,49 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { sniffImageExt } from './onebot-impl.js';
 
 export const SET_LIMIT = 120;
 const MAX_STATIC_BYTES = 512 * 1024;
 const MAX_VIDEO_BYTES = 256 * 1024;
 const FILE_ID_RE = /^[A-Za-z0-9_-]{10,255}$/;
-const EMOJI_RE = /\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic})*/gu;
+// emoji：基础字符 + 可选的肤色 / 变体选择符 / 零宽连接的组合
+const EMOJI_RE = /\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|\p{Variation_Selector}|\p{Join_Control}\p{Extended_Pictographic})*/gu;
+const VS16 = String.fromCodePoint(0xfe0f);
+const CONTROL_RE = /[\p{Cc}\p{Zl}\p{Zp}]+/gu;
+const cleanNote = (v, max = 60) => String(v ?? '').replace(CONTROL_RE, ' ').trim().slice(0, max);
+// 同一张 QQ 表情连续转换 / 上传失败这么多次就不再每轮重试（比如 ffmpeg 解不了的动态 WebP）
+const MAX_QQ_FAILURES = 3;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 纯函数 ────────────────────────────────────────────────────────────────
 
+/**
+ * 贴纸包名里带的一小段标记：由 bot id 和管理员 id 算出来（哈希，不会把管理员的 Telegram id 公开出去）。
+ * 换了 bot 或管理员，包名跟着变：file_id 只对建它的 bot 有效、包也只属于建它时的那个人，旧包接着用不了。
+ */
+export function stickerSetTag(botId, ownerId) {
+  return crypto.createHash('sha256').update(`${botId}:${ownerId}`).digest('hex').slice(0, 6);
+}
+
 /** 两个包的名字。Telegram 规定：字母开头、只含字母数字下划线、不能连续下划线、以 _by_<bot> 结尾、≤ 64。 */
-export function stickerSetNames(botUsername) {
+export function stickerSetNames(botUsername, tag) {
   const bot = String(botUsername ?? '').trim();
   if (!/^[A-Za-z][A-Za-z0-9_]{2,}$/.test(bot) || bot.includes('__')) throw new Error(`bot 用户名不合法：${bot}`);
+  if (!/^[0-9a-f]{6}$/.test(String(tag ?? ''))) throw new Error('贴纸包标记不合法');
   const make = (prefix) => {
-    const name = `${prefix}_by_${bot}`;
+    const name = `${prefix}_${tag}_by_${bot}`;
     if (name.length > 64) throw new Error(`贴纸包名太长：${name}`);
     return name;
   };
   return { fav: make('her_fav'), qq: make('her_qq') };
+}
+
+/** 一个 emoji：只有文字样式的符号（© ‼ 这类）补上 U+FE0F，Telegram 才认它是 emoji。 */
+function normalizeEmoji(e) {
+  if (e.includes(VS16) || /\p{Emoji_Presentation}/u.test(e)) return e;
+  return e + VS16;
 }
 
 /** 从备注里挑 emoji（贴纸至少要 1 个，最多 20 个）；挑不到就用默认的。 */
@@ -43,13 +68,14 @@ export function emojiListFor(texts, fallback = '🙂') {
   const found = [];
   for (const t of texts) {
     for (const m of String(t ?? '').matchAll(EMOJI_RE)) {
-      if (!found.includes(m[0])) found.push(m[0]);
+      const e = normalizeEmoji(m[0]);
+      if (!found.includes(e)) found.push(e);
       if (found.length >= 20) return found;
     }
   }
   if (found.length) return found;
   const fb = String(fallback ?? '').match(EMOJI_RE)?.[0];
-  return [fb || '🙂'];
+  return [fb ? normalizeEmoji(fb) : '🙂'];
 }
 
 /** 搜索关键词：最多 20 个、总长 ≤ 64。 */
@@ -81,6 +107,15 @@ export function isAnimatedGif(buffer) {
 
 // ── ffmpeg 转换 ──────────────────────────────────────────────────────────
 
+/** ffmpeg 能不能用（启动时检查一次，免得同步时每张表情都失败一遍）。 */
+export function ffmpegAvailable(ffmpeg = 'ffmpeg') {
+  try {
+    return spawnSync(ffmpeg, ['-version'], { windowsHide: true, stdio: 'ignore', timeout: 5000 }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
 function runFfmpeg(ffmpeg, args, timeoutMs = 30000) {
   return new Promise((resolve) => {
     let child;
@@ -107,7 +142,8 @@ function runFfmpeg(ffmpeg, args, timeoutMs = 30000) {
 const FIT_512 = 'scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos';
 
 /**
- * 图片字节 → 能进贴纸包的文件。动图 GIF 转视频贴纸（WEBM），其它一律取第一帧转静态 PNG。
+ * 图片字节 → 能进贴纸包的文件。动图 GIF 转视频贴纸（WEBM，超过 3 秒的截掉后面），
+ * 其它格式取第一帧转静态 PNG。ffmpeg 解不了的格式（比如部分版本解不了动态 WebP）会抛错。
  * @returns {Promise<{ buffer: Buffer, format: 'static' | 'video' }>}
  */
 export async function convertToSticker(buffer, { ffmpeg = 'ffmpeg', tmpRoot = os.tmpdir() } = {}) {
@@ -149,8 +185,8 @@ export async function convertToSticker(buffer, { ffmpeg = 'ffmpeg', tmpRoot = os
 
 // ── 本地记录 ──────────────────────────────────────────────────────────────
 
-function emptyStore() {
-  return { version: 1, sets: {}, favorites: [], qq: {} };
+function emptyStore(binding = '') {
+  return { version: 2, binding, sets: {}, favorites: [], qq: {}, qqFailed: {} };
 }
 
 function cleanFavorite(f) {
@@ -163,7 +199,7 @@ function cleanFavorite(f) {
     sourceUniqueId: String(f.sourceUniqueId ?? '').slice(0, 64),
     format: ['static', 'animated', 'video'].includes(f.format) ? f.format : 'static',
     emoji: String(f.emoji ?? '').slice(0, 16),
-    note: String(f.note ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').slice(0, 60),
+    note: cleanNote(f.note),
     thumbFileId: FILE_ID_RE.test(String(f.thumbFileId ?? '')) ? String(f.thumbFileId) : '',
     addedAt: Number(f.addedAt) || Date.now(),
     useCount: Math.max(0, Number(f.useCount) || 0),
@@ -185,7 +221,7 @@ export function cleanTgStickerRef(raw) {
 export function loadTgStickerStore(file) {
   if (!fs.existsSync(file)) return emptyStore();
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const store = emptyStore();
+  const store = emptyStore(/^[0-9a-f]{6}$/.test(String(raw?.binding ?? '')) ? raw.binding : '');
   if (raw?.sets && typeof raw.sets === 'object') {
     for (const k of ['fav', 'qq']) if (raw.sets[k]?.name) store.sets[k] = { name: String(raw.sets[k].name), createdAt: Number(raw.sets[k].createdAt) || 0 };
   }
@@ -193,6 +229,10 @@ export function loadTgStickerStore(file) {
   for (const [md5, v] of Object.entries(raw?.qq && typeof raw.qq === 'object' ? raw.qq : {})) {
     if (!/^[0-9A-F]{32}$/.test(md5) || !FILE_ID_RE.test(String(v?.fileId ?? ''))) continue;
     store.qq[md5] = { fileId: String(v.fileId), fileUniqueId: String(v.fileUniqueId ?? '').slice(0, 64), format: v.format === 'video' ? 'video' : 'static', syncedAt: Number(v.syncedAt) || 0 };
+  }
+  for (const [md5, v] of Object.entries(raw?.qqFailed && typeof raw.qqFailed === 'object' ? raw.qqFailed : {})) {
+    if (!/^[0-9A-F]{32}$/.test(md5)) continue;
+    store.qqFailed[md5] = { count: Math.max(0, Number(v?.count) || 0), lastAt: Number(v?.lastAt) || 0, reason: cleanNote(v?.reason, 120) };
   }
   return store;
 }
@@ -210,15 +250,23 @@ export function saveTgStickerStore(file, store) {
  * @param {object} opts
  * @param {import('./telegram.js').TelegramClient} opts.client
  * @param {number} opts.ownerId        贴纸包挂在谁名下（telegram.ownerId）
- * @param {{ username: string, first_name?: string }} opts.me
+ * @param {{ id: number, username: string, first_name?: string }} opts.me
  * @param {string} opts.storeFile
  * @param {(buf: Buffer) => Promise<{buffer: Buffer, format: string}>} opts.convert
  * @param {string} [opts.defaultEmoji]
  * @param {(...a: any[]) => void} [opts.log]
+ * @param {number} [opts.gapMs]       连续改包之间的间隔（避开 Telegram 限流）
  */
-export function createTgStickerManager({ client, ownerId, me, storeFile, convert, defaultEmoji = '🙂', log = () => {} }) {
-  const names = stickerSetNames(me.username);
+export function createTgStickerManager({ client, ownerId, me, storeFile, convert, defaultEmoji = '🙂', log = () => {}, gapMs = 1500 }) {
+  const tag = stickerSetTag(me.id, ownerId);
+  const names = stickerSetNames(me.username, tag);
   let store = loadTgStickerStore(storeFile);
+  if (store.binding !== tag) {
+    // 换了 bot 或管理员（或第一次用）：旧记录里的 file_id 和包都用不了了，从头来
+    if (store.binding) log(`[tg-sticker] bot 或 ownerId 变了，旧的贴纸包记录作废，改用新包 ${names.fav} / ${names.qq}`);
+    store = emptyStore(tag);
+    saveTgStickerStore(storeFile, store);
+  }
   let chain = Promise.resolve();
   // 所有改包的操作串行：同步任务和收藏可能同时发生，并发改同一个包会互相踩
   const serial = (fn) => {
@@ -228,23 +276,85 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
   };
   const save = () => saveTgStickerStore(storeFile, store);
   const title = (kind) => `${me.first_name || me.username} 的${kind === 'fav' ? '收藏' : ' QQ 表情'}`.slice(0, 64);
+  const isMissing = (error) => /STICKER_INVALID|STICKERSET_INVALID|not found/i.test(String(error?.message ?? ''));
+
+  /** 读包；刚改完包时读可能失败（网络 / 限流），多试两次。 */
+  async function readSet(name, tries = 3) {
+    let lastError;
+    for (let i = 0; i < tries; i++) {
+      try { return await client.getStickerSet(name); } catch (error) { lastError = error; }
+      if (gapMs) await sleep(gapMs);
+    }
+    throw lastError;
+  }
+
+  /**
+   * 本地记录和包里的实际内容对账。加贴纸成功、但随后读包失败时，包里会多出本地不知道的贴纸；
+   * 本地记录丢了 / 重置过也一样。不对账的话这些贴纸永远删不掉，迟早把 120 张占满。
+   *   qq 包：只归同步管，多出来的删掉；本地记着但包里没了的，忘掉（下一轮重新传）。
+   *   fav 包：多出来的都是她收藏过的，补记成收藏（备注空着）；包里没了的，从收藏里去掉。
+   */
+  async function reconcile(kind) {
+    const set = await readSet(names[kind]);
+    const inSet = new Map((set?.stickers ?? []).map((st) => [st.file_unique_id, st]));
+    let changed = false;
+    if (kind === 'qq') {
+      const tracked = new Set();
+      for (const [md5, v] of Object.entries(store.qq)) {
+        const st = inSet.get(v.fileUniqueId);
+        if (!st) { delete store.qq[md5]; changed = true; continue; }
+        tracked.add(v.fileUniqueId);
+        if (st.file_id !== v.fileId) { v.fileId = st.file_id; changed = true; }
+      }
+      for (const st of inSet.values()) {
+        if (tracked.has(st.file_unique_id)) continue;
+        try {
+          await client.deleteStickerFromSet(st.file_id);
+          log('[tg-sticker] QQ 表情包里有一张本地没记录的贴纸，已删掉');
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+        if (gapMs) await sleep(gapMs);
+      }
+    } else {
+      const before = store.favorites.length;
+      store.favorites = store.favorites.filter((f) => {
+        const st = inSet.get(f.fileUniqueId);
+        if (st && st.file_id !== f.fileId) { f.fileId = st.file_id; changed = true; }
+        return !!st;
+      });
+      if (store.favorites.length !== before) changed = true;
+      const known = new Set(store.favorites.map((f) => f.fileUniqueId));
+      for (const st of inSet.values()) {
+        if (known.has(st.file_unique_id)) continue;
+        const fav = cleanFavorite({
+          fileId: st.file_id, fileUniqueId: st.file_unique_id,
+          format: st.is_video ? 'video' : st.is_animated ? 'animated' : 'static',
+          emoji: st.emoji ?? '', thumbFileId: st.thumbnail?.file_id ?? ''
+        });
+        if (fav) { store.favorites.push(fav); changed = true; }
+      }
+    }
+    if (set && !store.sets[kind]) { store.sets[kind] = { name: names[kind], createdAt: Date.now() }; changed = true; }
+    if (changed) save();
+    return set;
+  }
 
   /** 往包里加一张，返回包里那张贴纸（拿它的 file_id 发送 / 删除）。包还没建就建。 */
-  async function addToSet(kind, inputSticker) {
+  async function addToSet(kind, inputSticker, before) {
     const name = names[kind];
-    const before = await client.getStickerSet(name);
     if (before && before.stickers.length >= SET_LIMIT) throw new Error(`贴纸包 ${name} 已满（${SET_LIMIT} 张）`);
-    const seen = new Set((before?.stickers ?? []).map((s) => s.file_unique_id));
+    const seen = new Set((before?.stickers ?? []).map((st) => st.file_unique_id));
     if (before) await client.addStickerToSet(ownerId, name, inputSticker);
     else await client.createNewStickerSet(ownerId, name, title(kind), [inputSticker]);
     if (!store.sets[kind]) {
       store.sets[kind] = { name, createdAt: Date.now() };
       save();
     }
-    const after = await client.getStickerSet(name);
-    const added = (after?.stickers ?? []).filter((s) => !seen.has(s.file_unique_id)).pop();
+    const after = await readSet(name);
+    const added = (after?.stickers ?? []).filter((st) => !seen.has(st.file_unique_id)).pop();
     if (!added) throw new Error('这张已经在贴纸包里了');
-    return added;
+    return { added, after };
   }
 
   async function uploadConverted(buffer) {
@@ -256,7 +366,6 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
   return {
     names,
     get store() { return store; },
-    reload() { store = loadTgStickerStore(storeFile); },
 
     favorites() { return store.favorites.slice(); },
 
@@ -271,32 +380,34 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
 
     /**
      * B：收藏一张 Telegram 上看到的贴纸或图片。
-     * source：{ sticker: { fileId, fileUniqueId, format, emoji, thumbFileId } } 收到的贴纸，原样进包（不用重新上传）；
+     * source：{ sticker: { fileId, fileUniqueId, format, emoji } } 收到的贴纸，原样进包（不用重新上传）；
      *         { image: Buffer } 图片，先转成贴纸规格再上传。
      */
     collect(source, note = '') {
       return serial(async () => {
+        const before = await reconcile('fav');
         const srcId = source.sticker?.fileUniqueId;
         if (srcId && store.favorites.some((f) => f.fileUniqueId === srcId || f.sourceUniqueId === srcId)) {
           throw new Error('这张已经收藏过了');
         }
+        const cleanedNote = cleanNote(note);
         let input;
         let emoji;
         if (source.sticker) {
-          emoji = emojiListFor([source.sticker.emoji, note], defaultEmoji);
-          input = { sticker: source.sticker.fileId, format: source.sticker.format, emoji_list: emoji, keywords: keywordsFor([note]) };
+          emoji = emojiListFor([source.sticker.emoji, cleanedNote], defaultEmoji);
+          input = { sticker: source.sticker.fileId, format: source.sticker.format, emoji_list: emoji, keywords: keywordsFor([cleanedNote]) };
         } else {
           const up = await uploadConverted(source.image);
-          emoji = emojiListFor([note], defaultEmoji);
-          input = { sticker: up.fileId, format: up.format, emoji_list: emoji, keywords: keywordsFor([note]) };
+          emoji = emojiListFor([cleanedNote], defaultEmoji);
+          input = { sticker: up.fileId, format: up.format, emoji_list: emoji, keywords: keywordsFor([cleanedNote]) };
         }
-        const added = await addToSet('fav', input);
+        const { added } = await addToSet('fav', input, before);
         const fav = cleanFavorite({
           fileId: added.file_id,
           fileUniqueId: added.file_unique_id,
           format: added.is_video ? 'video' : added.is_animated ? 'animated' : 'static',
           emoji: emoji[0],
-          note,
+          note: cleanedNote,
           thumbFileId: added.thumbnail?.file_id ?? '',
           sourceUniqueId: srcId ?? '',
           addedAt: Date.now()
@@ -310,7 +421,7 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
     noteFavorite(ref, note) {
       const f = this.findFavorite(ref);
       if (!f) return null;
-      f.note = String(note ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').slice(0, 60);
+      f.note = cleanNote(note);
       save();
       return f;
     },
@@ -325,15 +436,19 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
 
     /**
      * C：把 QQ 收藏表情同步进 qq 包。新增的转换上传，QQ 里删掉的从包里删掉。
-     * 一次最多处理 maxAdds 张，避免启动时一口气打满 Telegram 限流；用得多的先同步。
+     * 一轮最多尝试 maxAdds 张（成功失败都算），免得一口气打满 Telegram 限流；
+     * 同一张连续失败 3 次就不再重试（md5 是内容哈希，同一张图下次多半还是失败）。
      * @param {Array<{md5: string, desc?: string, localNote?: string, tags?: string[], useCount?: number}>} entries
      * @param {(entry: object) => Promise<Buffer>} download
      */
-    syncQq(entries, download, { maxAdds = 20, gapMs = 1500 } = {}) {
+    syncQq(entries, download, { maxAdds = 20 } = {}) {
       return serial(async () => {
-        const result = { added: 0, removed: 0, failed: 0, skipped: 0 };
+        const result = { added: 0, removed: 0, failed: 0, skipped: 0, gaveUp: 0 };
         const present = (Array.isArray(entries) ? entries : [])
           .filter((e) => /^[0-9A-F]{32}$/.test(String(e?.md5 ?? '').toUpperCase()));
+        // 一张能认的都没有（网关没连上、表情库没同步过、或者条目都缺 md5）：别动包，空列表会被当成「全删了」
+        if (!present.length) return result;
+        let set = await reconcile('qq');
         // 已经同步过、QQ 里还在的先占位；剩下的名额按使用次数补。
         // 不这样的话，超过 120 张时使用次数一变，包里的贴纸就会反复删了又加。
         const kept = present.filter((e) => store.qq[e.md5.toUpperCase()]);
@@ -347,31 +462,43 @@ export function createTgStickerManager({ client, ownerId, me, storeFile, convert
             await client.deleteStickerFromSet(v.fileId);
           } catch (error) {
             // 包里已经没有它了也算删掉
-            if (!/STICKER_INVALID|not found/i.test(String(error?.message))) { result.failed += 1; log(`[tg-sticker] 删除同步贴纸失败：${error?.message ?? error}`); continue; }
+            if (!isMissing(error)) { result.failed += 1; log(`[tg-sticker] 删除同步贴纸失败：${error?.message ?? error}`); continue; }
           }
           delete store.qq[md5];
           result.removed += 1;
           save();
+          if (gapMs) await sleep(gapMs);
         }
+        if (result.removed) set = await readSet(names.qq);
+        let attempts = 0;
         for (const e of wanted) {
           const md5 = e.md5.toUpperCase();
           if (store.qq[md5]) continue;
-          if (result.added >= maxAdds) { result.skipped += 1; continue; }
+          if ((store.qqFailed[md5]?.count ?? 0) >= MAX_QQ_FAILURES) { result.gaveUp += 1; continue; }
+          if (attempts >= maxAdds) { result.skipped += 1; continue; }
+          attempts += 1;
           try {
             const buf = await download(e);
             const up = await uploadConverted(buf);
             const texts = [e.desc, e.localNote, ...(e.tags || [])];
-            const added = await addToSet('qq', { sticker: up.fileId, format: up.format, emoji_list: emojiListFor(texts, defaultEmoji), keywords: keywordsFor(texts) });
+            const { added, after } = await addToSet('qq', { sticker: up.fileId, format: up.format, emoji_list: emojiListFor(texts, defaultEmoji), keywords: keywordsFor(texts) }, set);
+            set = after;
             store.qq[md5] = { fileId: added.file_id, fileUniqueId: added.file_unique_id, format: up.format, syncedAt: Date.now() };
+            delete store.qqFailed[md5];
             save();
             result.added += 1;
-            if (gapMs) await new Promise((r) => setTimeout(r, gapMs));
           } catch (error) {
             result.failed += 1;
-            log(`[tg-sticker] 同步 QQ 表情 ${md5.slice(0, 8)} 失败：${error?.message ?? error}`);
+            const prev = store.qqFailed[md5]?.count ?? 0;
+            store.qqFailed[md5] = { count: prev + 1, lastAt: Date.now(), reason: cleanNote(error?.message ?? error, 120) };
+            save();
+            log(`[tg-sticker] 同步 QQ 表情 ${md5.slice(0, 8)} 失败（第 ${prev + 1} 次）：${error?.message ?? error}`);
             if (/已满/.test(String(error?.message))) break;
             if (error?.code === 429) break; // 被限流就留到下一轮
+            // 读包失败时不知道包的现状，重新对账再继续
+            try { set = await readSet(names.qq); } catch { break; }
           }
+          if (gapMs) await sleep(gapMs);
         }
         return result;
       });
