@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>qq-bridge 连接配置</title>
+<style>
+:root {
+  --bg:#f7f8fb; --surface:#fff; --sunken:#f8f9fc; --border:#dfe4ed; --border-input:#dce2ec;
+  --text:#202635; --muted:#5d6878; --label:#566174; --placeholder:#929bad;
+  --accent:#4d6bfe; --accent-hover:#405de5; --accent-soft:#edf1ff; --accent-soft-fg:#405ee6;
+  --ok:#14804a; --ok-bg:#e8f6ee; --warn:#a15c00; --warn-bg:#fff4e0; --bad:#c2312f; --bad-bg:#fdecec;
+  --code-bg:#f3f5fa; --shadow:0 1px 2px #1a23400d, 0 4px 16px #1a234008;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#14161c; --surface:#1c1f27; --sunken:#181b22; --border:#2c313d; --border-input:#353b49;
+    --text:#e4e7ee; --muted:#9aa3b5; --label:#aab2c3; --placeholder:#6c7487;
+    --accent:#6f86ff; --accent-hover:#8396ff; --accent-soft:#262d48; --accent-soft-fg:#a9b6ff;
+    --ok:#4cc38a; --ok-bg:#16301f; --warn:#e0a548; --warn-bg:#33270f; --bad:#f07a78; --bad-bg:#3a1a1a;
+    --code-bg:#151821; --shadow:none;
+  }
+}
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif }
+main { max-width:760px; margin:0 auto; padding:28px 16px 120px }
+h1 { font-size:22px; margin:0 0 4px }
+.sub { color:var(--muted); margin:0 0 20px }
+.sub code { font-size:12px; word-break:break-all }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:18px 20px; margin-bottom:16px; box-shadow:var(--shadow) }
+.card h2 { font-size:16px; margin:0 0 2px; display:flex; align-items:center; gap:8px }
+.card .hint { color:var(--muted); font-size:13px; margin:0 0 14px }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:12px 14px }
+.full { grid-column:1 / -1 }
+@media (max-width:620px) { .grid { grid-template-columns:1fr } }
+label { display:block; font-size:13px; color:var(--label); margin-bottom:4px }
+input[type=text], input[type=password], select, textarea {
+  width:100%; padding:8px 10px; border:1px solid var(--border-input); border-radius:8px;
+  background:var(--sunken); color:var(--text); font:inherit;
+}
+textarea { min-height:64px; resize:vertical; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px }
+input::placeholder, textarea::placeholder { color:var(--placeholder) }
+input:focus, select:focus, textarea:focus { outline:2px solid var(--accent); outline-offset:0; border-color:transparent }
+input[aria-invalid=true] { border-color:var(--bad) }
+.field-note { font-size:12px; color:var(--muted); margin-top:3px }
+.row { display:flex; gap:8px; align-items:center }
+.row input { flex:1 }
+.check { display:flex; gap:8px; align-items:flex-start; font-size:13px; color:var(--text) }
+.check input { margin-top:4px }
+button { font:inherit; border-radius:8px; border:1px solid var(--border-input); background:var(--surface); color:var(--text); padding:7px 12px; cursor:pointer; white-space:nowrap }
+button:hover { border-color:var(--accent) }
+button:disabled { opacity:.55; cursor:default }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; padding:9px 18px }
+button.primary:hover { background:var(--accent-hover) }
+button.ghost { border-color:transparent; background:transparent; color:var(--accent-soft-fg) }
+.result { margin-top:12px; font-size:13px; display:none }
+.result.show { display:block }
+.pill { display:inline-flex; gap:6px; align-items:baseline; border-radius:8px; padding:6px 10px; margin:0 8px 6px 0; max-width:100% }
+.pill strong { white-space:nowrap; flex-shrink:0 }
+.pill.ok { background:var(--ok-bg); color:var(--ok) }
+.pill.bad { background:var(--bad-bg); color:var(--bad) }
+.pill.warn { background:var(--warn-bg); color:var(--warn) }
+.banner { border-radius:10px; padding:10px 14px; margin-bottom:16px; font-size:13px; display:none }
+.banner.show { display:block }
+.banner.warn { background:var(--warn-bg); color:var(--warn) }
+.banner.bad { background:var(--bad-bg); color:var(--bad) }
+.banner.ok { background:var(--ok-bg); color:var(--ok) }
+.banner ul { margin:4px 0 0; padding-left:20px }
+details { margin-top:12px }
+summary { cursor:pointer; color:var(--accent-soft-fg); font-size:13px }
+pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:12px; overflow:auto; font-size:12px; margin:8px 0 0 }
+code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:12.5px }
+.bar { position:fixed; left:0; right:0; bottom:0; background:color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter:blur(8px); border-top:1px solid var(--border) }
+.bar-inner { max-width:760px; margin:0 auto; padding:12px 16px; display:flex; align-items:center; gap:12px }
+.bar .status { flex:1; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis }
+.dirty .status { color:var(--warn) }
+</style>
+</head>
+<body>
+<main>
+  <h1>qq-bridge 连接配置</h1>
+  <p class="sub">桥接启动前要连上 QQ 网关和 DeepSeek Harness。这里改的是 <code id="cfgPath">config.json</code> 里这几项，其余设置原样保留。</p>
+
+  <div id="banner" class="banner" role="status"></div>
+
+  <section class="card" aria-labelledby="h-gw">
+    <h2 id="h-gw">QQ 网关</h2>
+    <p class="hint">NapCat 或 SnowLuma 的 OneBot v11 服务。两边的 token 要一致；NapCat 里 HTTP 和 WebSocket 两个服务请设成<strong>同一个</strong> token。</p>
+    <div class="grid">
+      <div>
+        <label for="impl">网关类型</label>
+        <select id="impl">
+          <option value="auto">自动识别</option>
+          <option value="napcat">NapCat</option>
+          <option value="snowluma">SnowLuma</option>
+        </select>
+        <div class="field-note">影响收藏表情等少数扩展接口</div>
+      </div>
+      <div>
+        <label for="token">访问令牌（token）</label>
+        <div class="row">
+          <input type="password" id="token" autocomplete="off" spellcheck="false" placeholder="NapCat 网络配置里的 token">
+          <button type="button" id="toggleToken" aria-label="显示令牌">显示</button>
+          <button type="button" id="genToken" title="生成一个随机 token">生成</button>
+        </div>
+      </div>
+      <div>
+        <label for="wsUrl">WebSocket 地址</label>
+        <input type="text" id="wsUrl" spellcheck="false" placeholder="ws://127.0.0.1:3001">
+      </div>
+      <div>
+        <label for="httpUrl">HTTP 地址</label>
+        <input type="text" id="httpUrl" spellcheck="false" placeholder="http://127.0.0.1:3000">
+      </div>
+      <div class="full">
+        <label class="check"><input type="checkbox" id="follow">
+          <span>跟随 SnowLuma 自动发现的端点（SnowLuma 换账号后端口会变时有用；<strong>NapCat 请关掉</strong>）</span></label>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button type="button" id="testGw">测试连接</button>
+    </div>
+    <div id="gwResult" class="result" aria-live="polite"></div>
+    <details id="napcatSnippet">
+      <summary>NapCat 网络配置该怎么填（按上面的值生成）</summary>
+      <p class="hint" style="margin-top:8px">在 NapCat WebUI「网络配置」里新建 HTTP 服务器和 WebSocket 服务器，填成下面这样；或者对照它改 <code>config/onebot11_&lt;QQ号&gt;.json</code>。</p>
+      <pre id="snippet"></pre>
+      <button type="button" id="copySnippet" style="margin-top:8px">复制</button>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="h-dsh">
+    <h2 id="h-dsh">DeepSeek Harness</h2>
+    <p class="hint">她的"脑子"。默认本机 3080 端口。</p>
+    <div class="grid">
+      <div>
+        <label for="dshUrl">地址</label>
+        <input type="text" id="dshUrl" spellcheck="false" placeholder="http://127.0.0.1:3080">
+      </div>
+      <div>
+        <label for="dshToken">API 令牌（可选）</label>
+        <input type="password" id="dshToken" autocomplete="off" spellcheck="false" placeholder="DSH 要求鉴权时才填">
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px"><button type="button" id="testDsh">测试连接</button></div>
+    <div id="dshResult" class="result" aria-live="polite"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-acl">
+    <h2 id="h-acl">谁能跟她说话</h2>
+    <p class="hint">只有白名单里的人和群会被理睬。多个号用逗号、空格或换行隔开。</p>
+    <div class="grid">
+      <div class="full">
+        <label for="owner">管理员 QQ（你自己）</label>
+        <input type="text" id="owner" inputmode="numeric" placeholder="10001">
+      </div>
+      <div>
+        <label for="allowPrivate">私聊白名单</label>
+        <textarea id="allowPrivate" placeholder="10001"></textarea>
+      </div>
+      <div>
+        <label for="allowGroups">群白名单</label>
+        <textarea id="allowGroups" placeholder="123456789"></textarea>
+      </div>
+      <div class="full">
+        <label class="check"><input type="checkbox" id="allowAll">
+          <span>两个白名单都空着时放行所有人（不推荐：谁加她都能让她说话）</span></label>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="bar" id="bar">
+  <div class="bar-inner">
+    <span class="status" id="status">正在读取…</span>
+    <button type="button" class="ghost" id="done">关闭配置页</button>
+    <button type="button" class="primary" id="save" disabled>保存</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+const TOKEN = new URLSearchParams(location.hash.slice(1)).get('t') || '';
+const $ = (id) => document.getElementById(id);
+let saved = '';
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { 'x-config-token': TOKEN, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok && !data.errors) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+const splitIds = (s) => s.split(/[\s,，、;；]+/).map((x) => x.trim()).filter(Boolean);
+
+function readForm() {
+  return {
+    gateway: { impl: $('impl').value, wsUrl: $('wsUrl').value.trim(), httpUrl: $('httpUrl').value.trim(), accessToken: $('token').value.trim(), followDiscoveredEndpoint: $('follow').checked },
+    dsh: { baseUrl: $('dshUrl').value.trim(), authToken: $('dshToken').value.trim() },
+    ownerQQ: $('owner').value.trim(),
+    allowPrivate: splitIds($('allowPrivate').value),
+    allowGroups: splitIds($('allowGroups').value),
+    allowAllWhenEmpty: $('allowAll').checked
+  };
+}
+
+function fillForm(f) {
+  $('impl').value = f.gateway.impl;
+  $('wsUrl').value = f.gateway.wsUrl;
+  $('httpUrl').value = f.gateway.httpUrl;
+  $('token').value = f.gateway.accessToken;
+  $('follow').checked = f.gateway.followDiscoveredEndpoint;
+  $('dshUrl').value = f.dsh.baseUrl;
+  $('dshToken').value = f.dsh.authToken;
+  $('owner').value = f.ownerQQ;
+  $('allowPrivate').value = f.allowPrivate.join(', ');
+  $('allowGroups').value = f.allowGroups.join(', ');
+  $('allowAll').checked = f.allowAllWhenEmpty;
+}
+
+function banner(kind, html) {
+  const b = $('banner');
+  b.className = 'banner' + (kind ? ' show ' + kind : '');
+  b.innerHTML = html || '';
+  // 保存按钮在底栏，提示在顶上：出错时滚过去，不然看不到
+  if (kind === 'bad' || kind === 'warn') b.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function portOf(u, d) { try { const x = new URL(u); return Number(x.port) || d; } catch { return d; } }
+
+function renderSnippet() {
+  const f = readForm().gateway;
+  const token = f.accessToken || '（先填 token）';
+  const cfg = {
+    network: {
+      httpServers: [{ name: 'http', enable: true, host: '127.0.0.1', port: portOf(f.httpUrl, 3000), enableCors: true, enableWebsocket: false, messagePostFormat: 'array', token, debug: false }],
+      websocketServers: [{ name: 'ws', enable: true, host: '127.0.0.1', port: portOf(f.wsUrl, 3001), messagePostFormat: 'array', reportSelfMessage: false, token, enableForcePushEvent: true, debug: false, heartInterval: 30000 }]
+    }
+  };
+  $('snippet').textContent = JSON.stringify(cfg, null, 2);
+}
+
+function updateDirty() {
+  const dirty = JSON.stringify(readForm()) !== saved;
+  $('save').disabled = !dirty;
+  $('bar').classList.toggle('dirty', dirty);
+  if (dirty) $('status').textContent = '有改动还没保存';
+  renderSnippet();
+}
+
+function pill(kind, label, text) {
+  return `<span class="pill ${kind}"><strong>${esc(label)}</strong>${esc(text)}</span>`;
+}
+
+$('testGw').addEventListener('click', async () => {
+  const btn = $('testGw');
+  const box = $('gwResult');
+  btn.disabled = true; btn.textContent = '测试中…';
+  try {
+    const f = readForm().gateway;
+    const r = await api('/api/test/gateway', { wsUrl: f.wsUrl, httpUrl: f.httpUrl, accessToken: String(f.accessToken) });
+    let html = '';
+    html += r.http.ok ? pill('ok', 'HTTP ✓ ', `${r.http.app}${r.http.login ? ' · 登录：' + r.http.login : ''}`) : pill('bad', 'HTTP ✗ ', r.http.error);
+    html += r.ws.ok ? pill('ok', 'WebSocket ✓ ', r.ws.login ? '登录：' + r.ws.login : '已连上') : pill('bad', 'WebSocket ✗ ', r.ws.error);
+    if (r.http.ok && r.http.impl !== 'unknown' && f.impl !== 'auto' && f.impl !== r.http.impl) {
+      html += pill('warn', '注意 ', `检测到的是 ${r.http.impl}，但上面选的是 ${f.impl}`);
+    }
+    if (r.http.ok && r.http.impl === 'napcat' && f.followDiscoveredEndpoint) {
+      html += pill('warn', '建议 ', 'NapCat 请把「跟随自动发现的端点」关掉');
+    }
+    if (r.remote) html += pill('warn', '注意 ', '地址不是本机：token 会经网络发出去');
+    box.innerHTML = html;
+  } catch (e) {
+    box.innerHTML = pill('bad', '测试失败 ', e.message);
+  } finally {
+    box.classList.add('show');
+    btn.disabled = false; btn.textContent = '测试连接';
+  }
+});
+
+$('testDsh').addEventListener('click', async () => {
+  const btn = $('testDsh');
+  const box = $('dshResult');
+  btn.disabled = true; btn.textContent = '测试中…';
+  try {
+    const r = await api('/api/test/dsh', { baseUrl: $('dshUrl').value.trim() });
+    box.innerHTML = (r.ok ? pill('ok', 'DSH ✓ ', `有响应（HTTP ${r.status}）`) : pill('bad', 'DSH ✗ ', r.error))
+      + (r.remote ? pill('warn', '注意 ', '地址不是本机') : '');
+  } catch (e) {
+    box.innerHTML = pill('bad', '测试失败 ', e.message);
+  } finally {
+    box.classList.add('show');
+    btn.disabled = false; btn.textContent = '测试连接';
+  }
+});
+
+$('save').addEventListener('click', async () => {
+  const btn = $('save');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    const form = readForm();
+    const r = await api('/api/config', form);
+    if (r.errors) {
+      banner('bad', '没保存，有几处要改：<ul>' + r.errors.map((e) => `<li>${esc(e)}</li>`).join('') + '</ul>');
+      $('status').textContent = '保存失败';
+      return;
+    }
+    saved = JSON.stringify(form);
+    $('bar').classList.remove('dirty');
+    $('status').textContent = '已保存 ' + new Date().toLocaleTimeString() + (r.backup ? ' · 旧文件备份为 config.json.bak' : '');
+    banner(r.bridgeRunning ? 'warn' : 'ok', r.bridgeRunning
+      ? '已保存。桥接正在运行，<strong>重启桥接</strong>后才会生效（macOS：双击 <code>restart.command</code>；Windows：<code>restart.bat</code>）。'
+      : '已保存。现在可以启动桥接了。');
+  } catch (e) {
+    banner('bad', '保存失败：' + esc(e.message));
+  } finally {
+    btn.textContent = '保存';
+    btn.disabled = JSON.stringify(readForm()) === saved;
+  }
+});
+
+$('toggleToken').addEventListener('click', () => {
+  const show = $('token').type === 'password';
+  $('token').type = show ? 'text' : 'password';
+  $('toggleToken').textContent = show ? '隐藏' : '显示';
+  $('toggleToken').setAttribute('aria-label', show ? '隐藏令牌' : '显示令牌');
+});
+
+$('genToken').addEventListener('click', () => {
+  if ($('token').value && !confirm('替换现有 token？NapCat 那边也要改成新的。')) return;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  $('token').value = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  $('token').type = 'text'; $('toggleToken').textContent = '隐藏';
+  $('napcatSnippet').open = true;
+  updateDirty();
+});
+
+$('copySnippet').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText($('snippet').textContent); $('copySnippet').textContent = '已复制'; }
+  catch { $('copySnippet').textContent = '复制失败，手动选中吧'; }
+  setTimeout(() => { $('copySnippet').textContent = '复制'; }, 1500);
+});
+
+$('done').addEventListener('click', async () => {
+  if (!$('save').disabled && !confirm('还有改动没保存，确定关闭？')) return;
+  try { await api('/api/shutdown', {}); } catch {}
+  document.body.innerHTML = '<main><h1>配置页已关闭</h1><p class="sub">可以关掉这个标签页了。要再改，重新运行 <code>npm run config</code>。</p></main>';
+});
+
+// 网关字段一改，上次的测试结果就不作数了
+['impl', 'wsUrl', 'httpUrl', 'token', 'follow'].forEach((id) => $(id).addEventListener('input', () => $('gwResult').classList.remove('show')));
+['dshUrl', 'dshToken'].forEach((id) => $(id).addEventListener('input', () => $('dshResult').classList.remove('show')));
+document.addEventListener('input', updateDirty);
+document.addEventListener('change', updateDirty);
+window.addEventListener('beforeunload', (e) => { if (!$('save').disabled) { e.preventDefault(); e.returnValue = ''; } });
+
+(async () => {
+  if (!TOKEN) {
+    banner('bad', '地址里缺少令牌。请用命令行打印出来的<strong>完整地址</strong>打开（<code>npm run config</code>）。');
+    $('status').textContent = '未连接';
+    return;
+  }
+  try {
+    const r = await api('/api/config');
+    fillForm(r.form);
+    saved = JSON.stringify(readForm());
+    $('cfgPath').textContent = r.configPath;
+    $('status').textContent = r.isNew ? '还没有 config.json：保存时会从模板新建' : '已读取当前配置';
+    if (r.bridgeRunning) banner('warn', `桥接正在运行。这里保存后要重启桥接才生效；其他设置（社交、角色、表情）在控制台 <code>http://127.0.0.1:${esc(r.consolePort)}</code> 里改。`);
+    renderSnippet();
+  } catch (e) {
+    banner('bad', '读不到配置：' + esc(e.message));
+    $('status').textContent = '未连接';
+  }
+})();
+</script>
+</body>
+</html>

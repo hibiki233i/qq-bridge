@@ -107,6 +107,11 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 
 > ⚠️ 真实 `config.json` 与 `state/` 不会进入公开仓库，仓库只提供脱敏的 `config.example.json` 模板。
 
+**不想手改 JSON？** 运行 `npm run config`（macOS 也可以双击 `config.command`），会在浏览器里打开一个连接配置页：
+QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和白名单都能在里面改，并且可以当场「测试连接」，还能按填好的值生成 NapCat 网络配置片段。
+这个页面不依赖桥接，桥接还没跑起来也能用。它只改这几项，其余字段原样保留；保存前会把旧文件备份成 `config.json.bak`。
+参数：`--no-open` 只打印地址，`--port 3199` 指定端口，`--config 路径` 改别的配置文件。
+
 | 字段 | 说明 |
 | --- | --- |
 | `dsh.baseUrl` | DSH Web 地址，默认 `http://127.0.0.1:3080` |
