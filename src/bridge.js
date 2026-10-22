@@ -22,7 +22,8 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
-import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
+import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, resolveFfmpeg, safeJoinLibrary } from './send-voice-lib.js';
+import { createTgStickerManager, convertToSticker, cleanTgStickerRef } from './tg-stickers.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { resolveImplSetting, detectImplFromVersion, buildFaceRemarkRequest, sniffImageExt } from './onebot-impl.js';
@@ -53,7 +54,8 @@ import {
   buildStickerContext,
   buildStickerStrategyHint,
   applyStickerNote,
-  markStickerUsed
+  markStickerUsed,
+  sanitizeStickerText
 } from './sticker-lib.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +70,8 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
+// 她在 Telegram 上的两个贴纸包（收藏 / QQ 同步）的本地记录
+const TG_STICKER_FILE = path.join(STATE_DIR, 'telegram-stickers.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
@@ -1222,7 +1226,7 @@ function log(...args) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
-const TELEGRAM_UNSUPPORTED = 'Telegram 会话不支持这个操作（拍一拍、语音、收藏表情、合并转发只有 QQ 有）';
+const TELEGRAM_UNSUPPORTED = 'Telegram 会话不支持这个操作（拍一拍、语音、合并转发只有 QQ 有）';
 const SEND_TIMEOUT_MS = 15000;
 // DSH 控制类调用（停任务/归档会话）的超时。这些 await 以前是裸的：DSH 接受了连接但
 // 不返回响应时，HTTP handler 永不返回，控制台与群消息一起失去响应（issue #32）。
@@ -1336,7 +1340,10 @@ function extractMediaFromSegments(segments) {
         // —— 只读 camelCase 的话这里会永远是空串，而且不会有任何报错。
         subType: (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '',
         summary: sanitizeMediaSummary(d.summary),
-        ...emojiFields
+        ...emojiFields,
+        // Telegram 贴纸：收藏时直接用原 file_id 进贴纸包（只认 Telegram 来的图）
+        ...(d.tg_sticker && String(d.file ?? '').startsWith('tgfile:') && cleanTgStickerRef(d.tg_sticker)
+          ? { tgSticker: cleanTgStickerRef(d.tg_sticker) } : {})
       });
     } else if (seg.type === 'mface') {
       // 市场表情（mface）：没有 image 段可用，emoji_id/url 是唯一来源。
@@ -1931,10 +1938,93 @@ async function main() {
   }
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
+  /**
+   * Telegram 会话里的表情包工具：
+   *   - tg: 开头的是她在 Telegram 收藏的贴纸，用 file_id 发真贴纸；
+   *   - QQ 收藏表情同步进过贴纸包的，也发真贴纸；
+   *   - 其余（或要 @ 人时：贴纸不能带说明文字）下载后以图片发出，GIF 用 sendAnimation 会动。
+   */
+  async function sendStickerTelegramV2(key, stickerRef, options = {}) {
+    const id = key.slice(key.indexOf(':') + 1);
+    const atUserId = options.atUserId;
+    const hasAt = atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '';
+    // 先确认连着、@ 的对象合法，再去下载表情、占发送队列
+    telegramTarget(id, atUserId);
+    const assertSendAllowed = captureSendGuard(key);
+    let replyTo = null;
+    const rawReply = options.replyToMessageId;
+    if (rawReply !== undefined && rawReply !== null && String(rawReply).trim() !== '') {
+      const rid = String(rawReply).trim();
+      if (!/^[1-9]\d*$/.test(rid)) throw new Error('Telegram 的 replyToMessageId 必须是正整数');
+      replyTo = Number(rid);
+    }
+    const ref = String(stickerRef ?? '').trim();
+    let fav = null;
+    let entry = null;
+    if (ref.startsWith('tg:')) {
+      fav = tg.stickers?.findFavorite(ref) ?? null;
+      if (!fav) throw new Error(`找不到 Telegram 收藏贴纸 ${ref}，请先用 qq_list_stickers 看 telegramFavorites`);
+      if (hasAt) throw new Error('贴纸不能带 @；想点名请先发一条 @ 的文字，再单独发贴纸');
+    } else {
+      const synced = await syncStickerLibrary(true);
+      entry = findSticker(synced?.entries ?? stickerEntries, ref);
+      if (!entry) throw new Error(`找不到表情 ${ref}，请先用 qq_list_stickers 获取有效 id`);
+    }
+    const stickerFileId = fav?.fileId ?? (hasAt ? null : tg.stickers?.qqFileIdFor(entry.md5));
+    const label = fav ? `[贴纸:${fav.note || fav.emoji || fav.id}]` : `[表情包:${entry.desc || entry.localNote || entry.id}]`;
+    const downloadImage = async () => {
+      if (!entry.url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
+      let fetched;
+      try {
+        fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
+      } catch (error) {
+        throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
+      }
+      // 要按图片格式选接口（GIF 走 sendAnimation），不是图片的字节别往上传
+      if (!looksLikeImageBuffer(fetched.buffer)) throw new Error(`表情 ${entry.id} 下载到的不是图片`);
+      return fetched.buffer;
+    };
+    const image = stickerFileId ? null : await downloadImage();
+    let sendResolve;
+    let sendReject;
+    const sendResult = new Promise((resolve, reject) => { sendResolve = resolve; sendReject = reject; });
+    tgSendChain = tgSendChain.then(async () => {
+      try {
+        await sleep(randInt(800, 2000));
+        assertSendAllowed();
+        let sent = null;
+        if (stickerFileId) {
+          try {
+            sent = await withTimeout(telegramSendStickerFile(id, stickerFileId, { replyTo, label }), SEND_TIMEOUT_MS, `Telegram发贴纸 ${key}`);
+          } catch (error) {
+            // 收藏贴纸没有别的发法；同步过的 QQ 表情（比如贴纸被人从包里删了）退回发图片
+            if (fav) throw error;
+            log(`[tg-sticker] 同步贴纸发送失败，改发图片：${error?.message ?? error}`);
+          }
+        }
+        if (!sent) {
+          const buf = image ?? await downloadImage();
+          // 上传另包一层超时（略大于客户端的 20 秒），一张大图卡住时别把 Telegram 的发送队列占太久
+          sent = await withTimeout(telegramSendImage(id, buf, { replyTo, atUserId, label }), 25000, `Telegram发图 ${key}`);
+        }
+        sendResolve(sent);
+      } catch (error) {
+        sendReject(error);
+      }
+    });
+    const sent = await sendResult;
+    if (fav) {
+      tg.stickers.markFavoriteUsed(fav.id);
+      return { entry: { ...fav, desc: fav.note }, messageId: sent?.message_id ?? null };
+    }
+    const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
+    stickerEntries = updated.entries;
+    saveStickerStoreSafe();
+    return { entry: updated.entry, messageId: sent?.message_id ?? null };
+  }
+
   async function sendStickerV2(key, stickerRef, options = {}) {
-    const onTelegram = parseConvKey(key)?.telegram === true;
-    // Telegram：先确认连着、@ 的对象合法，再去下载表情、占发送队列
-    if (onTelegram) telegramTarget(key.slice(key.indexOf(':') + 1), options.atUserId);
+    if (parseConvKey(key)?.telegram) return sendStickerTelegramV2(key, stickerRef, options);
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
@@ -1951,11 +2041,9 @@ async function main() {
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
-      if (onTelegram && Number(rid) <= 0) throw new Error('Telegram 的 replyToMessageId 必须是正整数');
       segments.push({ type: 'reply', data: { id: rid } });
     }
-    // Telegram 的 @ 由 telegramSendImage 校验（tg 开头的用户 id），这里只校验 QQ 号
-    if (!onTelegram && atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
       const at = String(atUserId).trim();
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
@@ -1967,34 +2055,22 @@ async function main() {
     } catch (error) {
       throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
     }
-    // Telegram 要按图片格式选接口（GIF 走 sendAnimation），不是图片的字节别往上传
-    if (onTelegram && !looksLikeImageBuffer(image.buffer)) throw new Error(`表情 ${entry.id} 下载到的不是图片`);
     segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    // 与文本发送共用同一条发送队列（QQ、Telegram 各一条），保证“先文字后表情”的真人顺序不被并发工具调用打乱。
+    // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
     let sendResolve;
     let sendReject;
     const sendResult = new Promise((resolve, reject) => {
       sendResolve = resolve;
       sendReject = reject;
     });
-    setSendChainFor(id, sendChainFor(id).then(async () => {
+    sendChain = sendChain.then(async () => {
       try {
         // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
         await sleep(randInt(800, 2000));
         assertSendAllowed();
-        if (onTelegram) {
-          // 上传另包一层超时（略大于客户端的 20 秒），一张大图卡住时别把 Telegram 的发送队列占太久
-          const sent = await withTimeout(telegramSendImage(id, image.buffer, {
-            replyTo: segments[0]?.type === 'reply' ? Number(segments[0].data.id) : null,
-            atUserId,
-            label: `[表情包:${entry.desc || entry.localNote || entry.id}]`
-          }), 25000, `Telegram发图 ${key}`);
-          sendResolve({ message_id: sent?.message_id ?? null });
-          return;
-        }
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -2013,7 +2089,7 @@ async function main() {
       } catch (error) {
         sendReject(error);
       }
-    }));
+    });
     const data = await sendResult;
     // 更新本地使用统计
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
@@ -2057,6 +2133,59 @@ async function main() {
   }
 
   // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（见 requestFaceRemark）。
+  /**
+   * B：在 Telegram 会话里收藏别人发的贴纸 / 图片，进她自己的 Telegram 贴纸包。
+   * 贴纸直接用原 file_id 进包；图片先转成贴纸规格（512 像素 PNG）再上传。
+   */
+  /** Telegram 会话的表情列表：标出哪些 QQ 表情能发成真贴纸，再附上她的 Telegram 收藏。 */
+  function withTelegramStickers(key, list, query = '') {
+    if (!parseConvKey(key)?.telegram) return list;
+    const q = String(query ?? '').trim().toLowerCase();
+    const favs = (tg.stickers?.favorites() ?? [])
+      .filter((f) => !q || `${f.note} ${f.emoji} ${f.id}`.toLowerCase().includes(q))
+      .map((f) => ({ id: f.id, emoji: f.emoji, note: f.note, format: f.format, useCount: f.useCount }));
+    return {
+      ...list,
+      stickers: (list.stickers || []).map((e) => ({ ...e, telegramSticker: !!tg.stickers?.qqFileIdFor(e.md5) })),
+      telegramFavorites: favs,
+      telegramHint: tg.stickers
+        ? 'Telegram 会话：telegramFavorites 是你在 Telegram 收藏的贴纸，qq_send_sticker 传它的 id（tg: 开头）发出；QQ 表情里 telegramSticker=true 的会发成真贴纸，其余发成图片'
+        : 'Telegram 贴纸包没启用：QQ 表情会以图片发出'
+    };
+  }
+
+  async function collectTelegramStickerV2(key, messageRef, remark) {
+    if (!cfg.telegram?.stickers?.favorites) throw new Error('Telegram 收藏贴纸已关闭（telegram.stickers.favorites=false）');
+    if (!tg.stickers) {
+      throw new Error(cfg.telegram?.ownerId
+        ? 'Telegram 贴纸包还没准备好（Telegram 没连上？）'
+        : 'Telegram 收藏需要管理员先在配置里填 telegram.ownerId（贴纸包要挂在一个真人名下）');
+    }
+    const assertSendAllowed = captureSendGuard(key);
+    const st = getSocialV2State(key);
+    const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === String(messageRef) || (m.messageId && String(m.messageId) === String(messageRef))));
+    if (!found) throw new Error('找不到这条消息，请确认 messageId/seq 有效且属于当前会话');
+    if (found.isSelf) throw new Error('不能收藏自己发的表情，只能收藏别人发的');
+    const media = (Array.isArray(found.media) ? found.media : [])[0];
+    if (!media) throw new Error('这条消息没有可收藏的贴纸/图片');
+    const maxRemarkChars = Math.max(1, Number(cfg.socialV2?.sticker?.collect?.maxRemarkChars) || 20);
+    const note = sanitizeStickerText(String(remark ?? '').trim(), maxRemarkChars);
+    let source;
+    const ref = media.tgSticker ? cleanTgStickerRef(media.tgSticker) : null;
+    if (ref) {
+      source = { sticker: ref };
+    } else if (media.kind === 'image' && String(media.file ?? '').startsWith('tgfile:')) {
+      const img = await fetchOneBotImage(media);
+      if (!img?.buffer) throw new Error('无法获取这张图片');
+      source = { image: img.buffer };
+    } else {
+      throw new Error('这条消息没有可收藏的贴纸/图片');
+    }
+    assertSendAllowed();
+    const fav = await tg.stickers.collect(source, note);
+    return { entry: fav, emojiId: fav.id, remark: note };
+  }
+
   async function collectStickerV2(key, messageRef, remark) {
     const assertSendAllowed = captureSendGuard(key);
     const st = getSocialV2State(key);
@@ -2440,7 +2569,7 @@ async function main() {
   // ── Telegram（可选的第二个入口）──────────────────────────────────────────
   // 和 QQ 共用同一套会话、人设和 DSH；会话 key 形如 private:tg123 / group:tg-100…。
   // client 在配置无误时创建；me（getMe 的结果）连上之后才有，没有 me 时不收也不发。
-  const tg = { client: null, me: null, cache: createTelegramMessageCache(), stop: null };
+  const tg = { client: null, me: null, cache: createTelegramMessageCache(), stop: null, stickers: null };
   if (cfg.telegram.enabled) {
     const problems = telegramConfigProblems(cfg.telegram);
     if (problems.length) {
@@ -2509,6 +2638,77 @@ async function main() {
     return sent;
   }
 
+  /** 用 file_id 往 Telegram 会话发一张贴纸（她的收藏，或同步过的 QQ 表情）。 */
+  async function telegramSendStickerFile(convId, fileId, { replyTo = null, label = '[贴纸]' } = {}) {
+    const { chatId, threadId } = telegramTarget(convId, null);
+    const sent = await tg.client.sendSticker(chatId, fileId, { replyTo, threadId });
+    rememberTelegramSent(chatId, sent, label);
+    return sent;
+  }
+
+  /**
+   * 贴纸包要挂在一个真人名下（telegram.ownerId）。没配就不建包：
+   * 表情照样能以图片发，只是没有 Telegram 收藏、也不会同步成真贴纸。
+   */
+  function setupTelegramStickers() {
+    const sc = cfg.telegram.stickers ?? {};
+    if (!sc.favorites && !sc.syncQQ) return;
+    if (!cfg.telegram.ownerId) {
+      log('ℹ️  Telegram 贴纸包需要 telegram.ownerId（贴纸包必须挂在一个真人名下）；没配时 QQ 表情在 Telegram 上以图片发出，也不能收藏 Telegram 贴纸');
+      return;
+    }
+    try {
+      const ffmpeg = resolveFfmpeg({ ffmpegPath: cfg.socialV2?.voice?.ffmpegPath || null });
+      tg.stickers = createTgStickerManager({
+        client: tg.client,
+        ownerId: cfg.telegram.ownerId,
+        me: tg.me,
+        storeFile: TG_STICKER_FILE,
+        convert: (buf) => convertToSticker(buf, { ffmpeg }),
+        defaultEmoji: sc.defaultEmoji,
+        log
+      });
+    } catch (error) {
+      log(`⚠️  Telegram 贴纸包不可用：${error?.message ?? error}`);
+      return;
+    }
+    log(`Telegram 贴纸包：收藏 t.me/addstickers/${tg.stickers.names.fav}${sc.syncQQ ? `，QQ 表情 t.me/addstickers/${tg.stickers.names.qq}` : ''}（还没有贴纸时链接打不开）`);
+    if (sc.syncQQ) {
+      setTimeout(() => { void runQqStickerSync(); }, 15000);
+      const timer = setInterval(() => { void runQqStickerSync(); }, 30 * 60 * 1000);
+      timer.unref?.();
+    }
+  }
+
+  // C：把 QQ 收藏表情同步进 Telegram 贴纸包（新增的转换上传，QQ 里删掉的从包里删）
+  let qqStickerSyncRunning = false;
+  async function runQqStickerSync() {
+    if (!tg.stickers || !cfg.telegram.stickers?.syncQQ || qqStickerSyncRunning) return null;
+    qqStickerSyncRunning = true;
+    try {
+      const synced = await syncStickerLibrary(false);
+      const entries = synced?.entries ?? [];
+      // QQ 表情库拿不到（网关没连上 / 刚启动还没同步过）时别动包：空列表会被当成「全删了」
+      if (!entries.length) return null;
+      const r = await tg.stickers.syncQq(entries, async (entry) => {
+        if (!entry.url) throw new Error('没有图片地址');
+        const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
+        if (!looksLikeImageBuffer(fetched.buffer)) throw new Error('下载到的不是图片');
+        return fetched.buffer;
+      });
+      if (r.added || r.removed || r.failed) {
+        log(`[tg-sticker] QQ 表情同步：新增 ${r.added}，删除 ${r.removed}，失败 ${r.failed}${r.skipped ? `，还有 ${r.skipped} 张下一轮再传` : ''}`);
+      }
+      if (r.skipped) setTimeout(() => { void runQqStickerSync(); }, 60000);
+      return r;
+    } catch (error) {
+      log(`[tg-sticker] QQ 表情同步失败：${error?.message ?? error}`);
+      return null;
+    } finally {
+      qqStickerSyncRunning = false;
+    }
+  }
+
   /** 连上 Telegram（getMe 失败就退避重试），然后开始长轮询收消息。 */
   async function startTelegram() {
     let delay = 5000;
@@ -2531,6 +2731,7 @@ async function main() {
       }
     }
     log(`Telegram 已连接：@${tg.me.username ?? '?'}（${tg.me.first_name ?? ''}）`);
+    setupTelegramStickers();
     tg.stop = startTelegramPolling({
       client: tg.client,
       timeoutSec: cfg.telegram.pollTimeoutSec,
@@ -5645,6 +5846,22 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
+          if (stickerId.startsWith('tg:')) {
+            const fav = tg.stickers?.findFavorite(stickerId);
+            if (!fav) { sendJson({ ok: false, error: `找不到 Telegram 收藏贴纸 ${stickerId}` }, 404); return; }
+            // 静态贴纸本身是 WEBP 图；动态 / 视频贴纸只能看缩略图
+            const viewId = fav.format === 'static' ? fav.fileId : fav.thumbFileId;
+            if (!viewId) { sendJson({ ok: false, error: '这张贴纸是动态的，没有可看的缩略图' }, 404); return; }
+            try {
+              const buf = await tg.client.downloadFile(viewId, MAX_MEDIA_BYTES);
+              const accepted = acceptImageBuffer(buf, 'Telegram 贴纸');
+              if (!accepted) { sendJson({ ok: false, error: '贴纸不是可识别的图片' }, 400); return; }
+              sendJson({ ok: true, key, sticker: { id: fav.id, emoji: fav.emoji, note: fav.note, format: fav.format }, image: { mimeType: accepted.mimeType, data: accepted.buffer.toString('base64') } });
+            } catch (error) {
+              sendJson({ ok: false, error: `获取贴纸图片失败：${error?.message ?? error}` }, 500);
+            }
+            return;
+          }
           try {
             const entry = await getStickerImageData(stickerId);
             const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
@@ -5701,6 +5918,13 @@ async function main() {
           const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
           const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
           const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
+          if (stickerId.startsWith('tg:')) {
+            // Telegram 收藏只有一句备注；note / usage 谁有用谁
+            const fav = tg.stickers?.noteFavorite(stickerId, note ?? usage ?? '');
+            if (!fav) { sendJson({ ok: false, error: `找不到 Telegram 收藏贴纸 ${stickerId}` }, 404); return; }
+            sendJson({ ok: true, key, sticker: fav });
+            return;
+          }
           const entry = applyStickerNoteV2(stickerId, note, tags, usage);
           if (!entry) { sendJson({ ok: false, error: `找不到表情 ${stickerId}` }, 404); return; }
           log(`[sticker] 更新表情本地认知 ${key}: ${entry.id}`);
@@ -6030,7 +6254,6 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
           const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
           const st = getSocialV2State(key);
           const collectCfg = cfg.socialV2?.sticker?.collect ?? {};
           if (collectCfg.enabled === false) { sendJson({ ok: false, error: 'AI 收藏表情功能已关闭' }, 403); return; }
@@ -6048,7 +6271,9 @@ async function main() {
           st.stickerCollectTimes.push(now);
           if (st.stickerCollectTimes.length > 500) st.stickerCollectTimes = st.stickerCollectTimes.slice(-500);
           try {
-            const result = await collectStickerV2(key, messageRef, remark);
+            const result = keyMatch.telegram
+              ? await collectTelegramStickerV2(key, messageRef, remark)
+              : await collectStickerV2(key, messageRef, remark);
             saveSocialV2State();
             log(`[sticker] AI 收藏表情 ${key}: ${result.emojiId}${result.remark ? '（备注：' + result.remark + '）' : ''}`);
             appendActivity(`${key} [sticker] AI 收藏表情：${result.remark || result.emojiId}`);
@@ -6128,7 +6353,7 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
           try {
             const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = withTelegramStickers(key, formatStickerList(synced?.entries ?? stickerEntries, query, count), query);
             sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
@@ -6155,7 +6380,7 @@ async function main() {
           }
           try {
             const synced = await syncStickerLibrary(force);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = withTelegramStickers(key, formatStickerList(synced?.entries ?? stickerEntries, query, count), query);
             sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
@@ -9907,6 +10132,10 @@ async function main() {
       if (m?.emojiId) item.emojiId = String(m.emojiId);
       if (m?.summary) item.summary = sanitizeMediaSummary(m.summary);
       if (m?.subType) item.subType = String(m.subType);
+      if (m?.tgSticker && String(m.file ?? '').startsWith('tgfile:')) {
+        const ref = cleanTgStickerRef(m.tgSticker);
+        if (ref) item.tgSticker = ref;
+      }
       return item;
     }).filter((m) => (m.kind === 'face' ? !!m.faceId : !!(m.file || m.url || m.emojiId))) : [];
     const safeForwardIds = (Array.isArray(forwardIds) ? forwardIds : []).map(sanitizeForwardId).filter(Boolean);
@@ -10298,7 +10527,10 @@ async function main() {
     const id = tg.me ? tgConvId(tg.me.id) : '';
     return `【你的身份】这是 Telegram 上的会话（不是 QQ），你在这里叫「${name || '（未取到）'}」${handle ? `（${handle}）` : ''}。`
       + `消息里 @ 你${id ? `（at 段里是 ${id}）` : ''}、或引用你的消息，指的都是你。`
-      + '这里能发文字和表情包（qq_send_sticker 会以图片发出）；拍一拍、语音、收藏表情、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
+      + (tg.stickers
+        ? '这里能发文字和表情包：qq_send_sticker 发你在 Telegram 收藏的贴纸（id 以 tg: 开头）或 QQ 表情（同步过的发成真贴纸，其余发成图片）；看到喜欢的贴纸可以用 qq_collect_sticker 收进你的 Telegram 贴纸包。'
+        : '这里能发文字和表情包（qq_send_sticker 会以图片发出）。')
+      + '拍一拍、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
   }
 
   function buildWakePromptV2(key, reason) {
@@ -10316,8 +10548,10 @@ async function main() {
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
+    const tgFavCount = isTelegram ? (tg.stickers?.favorites().length ?? 0) : 0;
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
+      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n`
+        + (tgFavCount ? `你在 Telegram 收藏了 ${tgFavCount} 张贴纸，qq_list_stickers 的 telegramFavorites 里能看到。\n` : '') + '\n'
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';

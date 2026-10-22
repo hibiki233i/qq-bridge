@@ -90,7 +90,13 @@ export function normalizeTelegramConfig(raw) {
       private: normalizeTgIdList(t.allow?.private, { allowNegative: false }),
       groups: normalizeTgIdList(t.allow?.groups, { allowNegative: true })
     },
-    pollTimeoutSec
+    pollTimeoutSec,
+    // 贴纸包（要 ownerId）：favorites = 她在 Telegram 上收藏贴纸；syncQQ = 把 QQ 收藏表情同步成贴纸包
+    stickers: {
+      favorites: t.stickers?.favorites !== false,
+      syncQQ: t.stickers?.syncQQ !== false,
+      defaultEmoji: String(t.stickers?.defaultEmoji ?? '🙂').slice(0, 16) || '🙂'
+    }
   };
 }
 
@@ -329,6 +335,48 @@ export class TelegramClient {
     });
   }
 
+  /** 用 file_id 发一张已经在 Telegram 服务器上的贴纸（收到过的、或贴纸包里的）。 */
+  async sendSticker(chatId, fileId, { replyTo = null, threadId = null } = {}) {
+    const params = { chat_id: chatId, sticker: String(fileId) };
+    if (replyTo) params.reply_parameters = { message_id: Number(replyTo), allow_sending_without_reply: true };
+    if (threadId) params.message_thread_id = Number(threadId);
+    return await this.call('sendSticker', params, { timeoutMs: SEND_TIMEOUT_MS });
+  }
+
+  // ── 贴纸包（bot 自己建、挂在某个用户名下；Bot API 没有读写用户收藏夹的接口）──
+
+  /** 上传一个贴纸文件，返回 File（拿 file_id 去建包 / 加贴纸）。format：static | animated | video */
+  async uploadStickerFile(userId, buffer, format) {
+    const ext = format === 'video' ? 'webm' : format === 'animated' ? 'tgs' : 'png';
+    const type = format === 'video' ? 'video/webm' : format === 'animated' ? 'application/x-tgsticker' : 'image/png';
+    return await this.call('uploadStickerFile', { user_id: Number(userId), sticker_format: format }, {
+      timeoutMs: UPLOAD_TIMEOUT_MS,
+      file: { field: 'sticker', filename: `sticker.${ext}`, contentType: type, buffer }
+    });
+  }
+
+  /** 读贴纸包；包不存在返回 null。 */
+  async getStickerSet(name) {
+    try {
+      return await this.call('getStickerSet', { name });
+    } catch (error) {
+      if (error?.code === 400 && /STICKERSET_INVALID|not found|invalid/i.test(String(error.message))) return null;
+      throw error;
+    }
+  }
+
+  createNewStickerSet(userId, name, title, stickers) {
+    return this.call('createNewStickerSet', { user_id: Number(userId), name, title, stickers });
+  }
+
+  addStickerToSet(userId, name, sticker) {
+    return this.call('addStickerToSet', { user_id: Number(userId), name, sticker });
+  }
+
+  deleteStickerFromSet(fileId) {
+    return this.call('deleteStickerFromSet', { sticker: String(fileId) });
+  }
+
   /** 下载一个文件（图片）；超过 maxBytes 直接拒绝。 */
   async downloadFile(fileId, maxBytes) {
     const file = await this.call('getFile', { file_id: String(fileId) });
@@ -439,8 +487,13 @@ function mediaSegments(msg, maxBytes) {
   }
   if (msg.sticker) {
     const s = msg.sticker;
-    if (!s.is_animated && !s.is_video) {
-      segs.push({ type: 'image', data: { file: `tgfile:${s.file_id}`, url: '', summary: s.emoji || '贴纸' } });
+    const format = s.is_video ? 'video' : s.is_animated ? 'animated' : 'static';
+    // 给模型看的图：静态贴纸就是它本身（WEBP），动态 / 视频贴纸用缩略图
+    const viewId = format === 'static' ? s.file_id : s.thumbnail?.file_id;
+    // tg_sticker 留着收藏用：收藏贴纸直接用原 file_id 进贴纸包，不用重新上传
+    const tgSticker = { file_id: s.file_id, file_unique_id: s.file_unique_id, format, emoji: s.emoji || '' };
+    if (viewId) {
+      segs.push({ type: 'image', data: { file: `tgfile:${viewId}`, url: '', summary: s.emoji || '贴纸', tg_sticker: tgSticker } });
     } else {
       segs.push({ type: 'text', data: { text: `[贴纸${s.emoji ? `:${s.emoji}` : ''}]` } });
     }

@@ -42,6 +42,11 @@
     "allow": {
       "private": [],
       "groups": []
+    },
+    "stickers": {
+      "favorites": true,
+      "syncQQ": true,
+      "defaultEmoji": "🙂"
     }
   },
   "ackMessage": "",

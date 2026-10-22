@@ -172,7 +172,7 @@ code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:
 
   <section class="card" aria-labelledby="h-tg">
     <h2 id="h-tg">Telegram（可选）</h2>
-    <p class="hint">和 QQ 是同一个她：同一套人设、记忆和 DSH。收发文字和图片，她的表情包会以图片发出；拍一拍、语音、收藏表情只在 QQ 上有。</p>
+    <p class="hint">和 QQ 是同一个她：同一套人设、记忆和 DSH。收发文字和图片，也能发表情包、收藏贴纸；拍一拍、语音、合并转发只在 QQ 上有。</p>
     <div class="grid">
       <div class="full">
         <label class="check"><input type="checkbox" id="tgEnabled">
@@ -204,6 +204,13 @@ code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:
         <label for="tgAllowGroups">群白名单</label>
         <textarea id="tgAllowGroups" placeholder="-1001234567890"></textarea>
         <div class="field-note">群 id 是负数，一般 -100 开头</div>
+      </div>
+      <div class="full">
+        <label class="check"><input type="checkbox" id="tgStickerFav">
+          <span>让她收藏 Telegram 贴纸（存进她自己的贴纸包，挂在上面的管理员名下）</span></label>
+        <label class="check"><input type="checkbox" id="tgStickerSync">
+          <span>把 QQ 收藏表情同步成 Telegram 贴纸包，发出去是真贴纸而不是图片（需要 ffmpeg，最多 120 张）</span></label>
+        <div class="field-note">这两项都要先填管理员 Telegram id，并且你用这个号给 bot 发过消息</div>
       </div>
     </div>
     <div class="row" style="margin-top:14px"><button type="button" id="testTg">测试连接</button></div>
@@ -258,7 +265,9 @@ function readForm() {
       proxy: $('tgProxy').value.trim(),
       ownerId: $('tgOwner').value.trim(),
       allowPrivate: splitIds($('tgAllowPrivate').value),
-      allowGroups: splitIds($('tgAllowGroups').value)
+      allowGroups: splitIds($('tgAllowGroups').value),
+      stickerFavorites: $('tgStickerFav').checked,
+      stickerSyncQQ: $('tgStickerSync').checked
     }
   };
 }
@@ -281,6 +290,8 @@ function fillForm(f) {
   $('tgOwner').value = f.telegram.ownerId;
   $('tgAllowPrivate').value = f.telegram.allowPrivate.join(', ');
   $('tgAllowGroups').value = f.telegram.allowGroups.join(', ');
+  $('tgStickerFav').checked = f.telegram.stickerFavorites;
+  $('tgStickerSync').checked = f.telegram.stickerSyncQQ;
 }
 
 function banner(kind, html) {
