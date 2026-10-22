@@ -1132,6 +1132,89 @@ await test('同一个人：配置页按行读写，保留 prefer，格式错和�
   assert.equal(bad.errors.length, 3, JSON.stringify(bad.errors));
 });
 
+await test('同一个人：QQ 那边没放行时，拍一拍 / 语音 / 兜底发送都不会发到 QQ', async () => {
+  const cfg = { ...LINK_CONFIG, deny: { private: ['10001'] } };
+  const h = await bridgeHarness({ config: cfg });
+  try {
+    const calls = fakeTelegram(h);
+    h.setMode('reserved2');
+    const r = tgEventFor(h, 'hi', 51);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const st = h.getSocialV2State('private:10001');
+    await withServer(h, async (port) => {
+      const poke = await consoleCall(port, '/api/socialV2/send-poke', { method: 'POST', token: st.agentToken, body: { key: 'private:10001' } });
+      assert.equal(poke.status, 403, `拍一拍只看 QQ 白名单：${poke.body}`);
+    });
+    await assert.rejects(h.sendVoiceV2('private:tg222', '/nonexistent.mp3'), /QQ 那边没有放行/);
+    // Telegram 没连上：两边都发不了，绝不退回 QQ
+    h.tg.me = null;
+    assert.equal(h.resolveDeliveryKey('private:10001'), null);
+    await h.sendToQQ('private:10001', '不该发出去');
+    assert.equal(h.calls.sent.length, 0, '没发到 QQ');
+    await withServer(h, async (port) => {
+      const res = await consoleCall(port, '/api/socialV2/send-message', { method: 'POST', token: st.agentToken, body: { key: 'private:10001', messages: ['x'] } });
+      assert.equal(res.status, 500);
+      assert.match(res.json.error, /两边的平台现在都发不了/);
+    });
+    assert.ok(!h.calls.http.some((x) => /send_private_msg/.test(x.url)));
+    assert.equal(calls.filter((c) => c.text).length, 0);
+  } finally { await h.close(); }
+});
+
+await test('同一个人：一组消息发到一半撤掉那边的白名单，剩下的不再发', async () => {
+  const h = await bridgeHarness({ config: LINK_CONFIG });
+  try {
+    const calls = fakeTelegram(h);
+    h.setMode('chat');
+    const r = tgEventFor(h, 'hi', 52);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const done = h.sendBurstToQQ('private:10001', ['第一条', '第二条'], 300, 300);
+    await sleep(100);
+    h.cfg.telegram.allow.private = [];
+    await done;
+    assert.deepEqual(calls.filter((c) => c.text && c.text !== h.cfg.ackMessage).map((c) => c.text), ['第一条']);
+    assert.equal(h.calls.sent.length, 0, '也不改发到 QQ（发送平台在排队时就定了）');
+  } finally { await h.close(); }
+});
+
+await test('同一个人：合并掉的 Telegram 私聊旧状态先备份；消息记下来源平台（重启后引用判断还在）', async () => {
+  const h = await bridgeHarness({ config: LINK_CONFIG, files: { 'state/social-v2.json': { conversations: { 'private:tg222': { agentToken: 'c'.repeat(32), recentMessages: [{ seq: 1, text: '旧消息' }] } } } } });
+  try {
+    fakeTelegram(h);
+    const backup = JSON.parse(fs.readFileSync(path.join(h.temp, 'state/social-v2.linked-backup.json'), 'utf8'));
+    assert.equal(backup['private:tg222'].recentMessages[0].text, '旧消息');
+    assert.equal((fs.statSync(path.join(h.temp, 'state/social-v2.linked-backup.json')).mode & 0o777), 0o600);
+    h.setMode('reserved2');
+    const r = tgEventFor(h, 'hi', 53);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    await h.handleIncoming('private', 10001, qqEvent('qq', 53), h.cfg);
+    const st = h.getSocialV2State('private:10001');
+    assert.deepEqual([...st.recentMessages.filter((m) => m.messageId === '53').map((m) => m.via)].sort(), ['qq', 'telegram'], '两边 id 撞了也分得清来源');
+  } finally { await h.close(); }
+});
+
+await test('同一个人：合并的私聊里收藏 Telegram 贴纸进 Telegram 贴纸包', async () => {
+  botApi.sets.clear();
+  const h = await bridgeHarness({ config: { ...LINK_CONFIG, telegram: { ...LINK_CONFIG.telegram, ownerId: 111, stickers: { favorites: true } } } });
+  try {
+    h.tg.client = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
+    h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
+    h.setupTelegramStickers();
+    h.setMode('reserved2');
+    const r = updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, message_id: 61,
+      sticker: { file_id: 'CAACAgIAAxkBAAF1', file_unique_id: 'AgAD61', is_animated: false, is_video: false, emoji: '🐶' } }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const st = h.getSocialV2State('private:10001');
+    await withServer(h, async (port) => {
+      const res = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:10001', messageId: '61' } });
+      assert.equal(res.status, 200, res.body);
+      assert.match(res.json.emojiId, /^tg:/, '进的是 Telegram 贴纸包');
+      const list = await consoleCall(port, '/api/socialV2/sticker-list', { method: 'POST', token: st.agentToken, body: { key: 'private:10001' } });
+      assert.equal(list.json.telegramFavorites.length, 1, '会发到 Telegram 时列出 Telegram 收藏');
+    });
+  } finally { await h.close(); }
+});
+
 await test('同一个人：prefer 指定平台', async () => {
   const h = await bridgeHarness({ config: { ...LINK_CONFIG, telegram: { ...LINK_CONFIG.telegram, links: [{ qq: 10001, telegram: 222, prefer: 'qq' }] } } });
   try {
