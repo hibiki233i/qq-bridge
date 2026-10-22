@@ -183,6 +183,42 @@ export async function convertToSticker(buffer, { ffmpeg = 'ffmpeg', tmpRoot = os
   }
 }
 
+/**
+ * Telegram 贴纸 → QQ 收藏表情能用的图片。QQ 不认 WEBP / WEBM：
+ *   static（WEBP）→ PNG；video（WEBM，带透明）→ GIF（最长 3 秒、240 像素宽、256 色调色板）。
+ * 动画贴纸（TGS，矢量）要专门的渲染器，这里不处理，调用方改用它的缩略图（按 static 传进来）。
+ * @returns {Promise<Buffer>}
+ */
+export async function convertStickerForQQ(buffer, format, { ffmpeg = 'ffmpeg', tmpRoot = os.tmpdir(), maxBytes = 8 * 1024 * 1024 } = {}) {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'qq-bridge-tgsticker-'));
+  try {
+    try { fs.chmodSync(dir, 0o700); } catch {}
+    if (format === 'video') {
+      const input = path.join(dir, 'in.webm');
+      fs.writeFileSync(input, buffer, { mode: 0o600 });
+      const out = path.join(dir, 'out.gif');
+      // 指定 libvpx-vp9 解码器才能读到透明通道
+      const r = await runFfmpeg(ffmpeg, ['-v', 'error', '-y', '-c:v', 'libvpx-vp9', '-i', input, '-t', '3',
+        '-vf', 'fps=15,scale=240:240:force_original_aspect_ratio=decrease:flags=lanczos,split[a][b];[b]palettegen=reserve_transparent=1[p];[a][p]paletteuse',
+        '-loop', '0', out]);
+      if (!r.ok) throw new Error(r.error);
+      const bytes = fs.readFileSync(out);
+      if (bytes.length > maxBytes) throw new Error('转出来的 GIF 太大');
+      return bytes;
+    }
+    const input = path.join(dir, `in.${sniffImageExt(buffer)}`);
+    fs.writeFileSync(input, buffer, { mode: 0o600 });
+    const out = path.join(dir, 'out.png');
+    const r = await runFfmpeg(ffmpeg, ['-v', 'error', '-y', '-i', input, '-frames:v', '1', out]);
+    if (!r.ok) throw new Error(r.error);
+    const bytes = fs.readFileSync(out);
+    if (bytes.length > maxBytes) throw new Error('转出来的图片太大');
+    return bytes;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── 本地记录 ──────────────────────────────────────────────────────────────
 
 function emptyStore(binding = '') {

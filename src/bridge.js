@@ -23,7 +23,7 @@ import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, resolveFfmpeg, safeJoinLibrary } from './send-voice-lib.js';
-import { createTgStickerManager, convertToSticker, cleanTgStickerRef, ffmpegAvailable } from './tg-stickers.js';
+import { createTgStickerManager, convertToSticker, convertStickerForQQ, cleanTgStickerRef, ffmpegAvailable } from './tg-stickers.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { resolveImplSetting, detectImplFromVersion, buildFaceRemarkRequest, sniffImageExt } from './onebot-impl.js';
@@ -2196,9 +2196,19 @@ async function main() {
     };
   }
 
+  /**
+   * Telegram 上收藏别人发的贴纸 / 图片。两个去处，各自看开关：
+   *   - 她的 Telegram 贴纸包（telegram.stickers.favorites，要 ownerId）：贴纸直接用原 file_id 进包，图片转成 512px 再上传；
+   *   - 同时存一份进 QQ 收藏表情（telegram.stickers.copyToQQ，默认开）：这样在 QQ 上也能发。
+   *     QQ 不认 WEBP / WEBM，静态贴纸转 PNG、视频贴纸转 GIF；矢量动画贴纸（TGS）只能存它的静态缩略图。
+   * 一边成功就算收藏成功，另一边的失败写进返回结果里。
+   */
   async function collectTelegramStickerV2(key, messageRef, remark) {
-    if (!cfg.telegram?.stickers?.favorites) throw new Error('Telegram 收藏贴纸已关闭（telegram.stickers.favorites=false）');
-    if (!tg.stickers) {
+    const sc = cfg.telegram?.stickers ?? {};
+    const toTelegram = sc.favorites === true;
+    const toQQ = sc.copyToQQ !== false;
+    if (!toTelegram && !toQQ) throw new Error('Telegram 上的收藏已关闭（telegram.stickers.favorites / copyToQQ 都关着）');
+    if (toTelegram && !toQQ && !tg.stickers) {
       throw new Error(cfg.telegram?.ownerId
         ? 'Telegram 贴纸包还没准备好（Telegram 没连上？）'
         : 'Telegram 收藏需要管理员先在配置里填 telegram.ownerId（贴纸包要挂在一个真人名下）');
@@ -2214,20 +2224,64 @@ async function main() {
     if (!media) throw new Error('这条消息没有可收藏的贴纸/图片');
     const maxRemarkChars = Math.max(1, Number(cfg.socialV2?.sticker?.collect?.maxRemarkChars) || 20);
     const note = sanitizeStickerText(String(remark ?? '').trim(), maxRemarkChars);
-    let source;
     const ref = media.tgSticker ? cleanTgStickerRef(media.tgSticker) : null;
-    if (ref) {
-      source = { sticker: ref };
-    } else if (media.kind === 'image' && String(media.file ?? '').startsWith('tgfile:')) {
+    let image = null;
+    if (!ref) {
+      if (!(media.kind === 'image' && String(media.file ?? '').startsWith('tgfile:'))) throw new Error('这条消息没有可收藏的贴纸/图片');
       const img = await fetchOneBotImage(media);
       if (!img?.buffer) throw new Error('无法获取这张图片');
-      source = { image: img.buffer };
-    } else {
-      throw new Error('这条消息没有可收藏的贴纸/图片');
+      image = img.buffer;
     }
     assertSendAllowed();
-    const fav = await tg.stickers.collect(source, note);
-    return { entry: fav, emojiId: fav.id, remark: note };
+    const result = { entry: null, emojiId: '', remark: note, telegram: null, qq: null };
+    if (toTelegram) {
+      try {
+        if (!tg.stickers) throw new Error(cfg.telegram?.ownerId ? 'Telegram 贴纸包还没准备好' : '没配 telegram.ownerId');
+        const fav = await tg.stickers.collect(ref ? { sticker: ref } : { image }, note);
+        result.telegram = { ok: true, id: fav.id };
+        result.entry = fav;
+        result.emojiId = fav.id;
+      } catch (error) {
+        result.telegram = { ok: false, error: error?.message ?? String(error) };
+      }
+    }
+    if (toQQ) {
+      try {
+        const face = await telegramMediaForQQ(media, ref, image);
+        assertSendAllowed();
+        const added = await addFaceToQQ(face, note, assertSendAllowed);
+        result.qq = { ok: true, id: added.emojiId };
+        if (!result.entry) { result.entry = added.entry; result.emojiId = added.emojiId; }
+      } catch (error) {
+        result.qq = { ok: false, error: error?.message ?? String(error) };
+      }
+    }
+    if (!result.telegram?.ok && !result.qq?.ok) {
+      throw new Error([result.telegram && `Telegram 贴纸包：${result.telegram.error}`, result.qq && `QQ 收藏：${result.qq.error}`].filter(Boolean).join('；'));
+    }
+    return result;
+  }
+
+  /** Telegram 上的贴纸 / 图片 → 能存进 QQ 收藏表情的图片字节。 */
+  async function telegramMediaForQQ(media, ref, image) {
+    if (!tg.client) throw new Error('Telegram 未连接');
+    const ffmpeg = resolveFfmpeg({ ffmpegPath: cfg.socialV2?.voice?.ffmpegPath || null });
+    let buf;
+    let format = 'static';
+    if (image) {
+      buf = image;
+    } else if (ref.format === 'video') {
+      buf = await tg.client.downloadFile(ref.fileId, MAX_MEDIA_BYTES);
+      format = 'video';
+    } else {
+      // 静态贴纸：media.file 就是它本身（WEBP）；矢量动画贴纸：media.file 是它的缩略图
+      buf = await tg.client.downloadFile(String(media.file).slice('tgfile:'.length), MAX_MEDIA_BYTES);
+    }
+    const ext = sniffImageExt(buf);
+    // QQ 认 PNG / JPG / GIF；已经是这几种的图片不用转（也就不依赖 ffmpeg）
+    if (format === 'static' && looksLikeImageBuffer(buf) && ext !== 'webp') return buf;
+    if (!ffmpegAvailable(ffmpeg)) throw new Error('找不到 ffmpeg，Telegram 贴纸转不成 QQ 能用的图片');
+    return convertStickerForQQ(buf, format, { ffmpeg, maxBytes: MAX_MEDIA_BYTES });
   }
 
   async function collectStickerV2(key, messageRef, remark) {
@@ -2261,6 +2315,15 @@ async function main() {
       }
     }
     if (!file || !faceBuffer) throw new Error('无法获取该表情的图片源');
+    return addFaceToQQ(faceBuffer, remark, assertSendAllowed);
+  }
+
+  /**
+   * 把一张图存进 QQ 收藏表情（add_custom_face），刷新表情库，再写备注。
+   * QQ 会话里的收藏、和 Telegram 上收藏时「同时存一份进 QQ」共用这一段。
+   */
+  async function addFaceToQQ(faceBuffer, remark, assertSendAllowed = () => {}) {
+    const file = 'base64://' + faceBuffer.toString('base64');
     const impl = await getOneBotImpl();
     const md5 = crypto.createHash('md5').update(faceBuffer).digest('hex').toUpperCase();
     assertSendAllowed();
@@ -6420,7 +6483,11 @@ async function main() {
             saveSocialV2State();
             log(`[sticker] AI 收藏表情 ${key}: ${result.emojiId}${result.remark ? '（备注：' + result.remark + '）' : ''}`);
             appendActivity(`${key} [sticker] AI 收藏表情：${result.remark || result.emojiId}`);
-            sendJson({ ok: true, key, sticker: result.entry, emojiId: result.emojiId, remark: result.remark });
+            sendJson({
+              ok: true, key, sticker: result.entry, emojiId: result.emojiId, remark: result.remark,
+              // Telegram 上收藏时两个去处各自的结果（只成功了一边时，另一边的原因在这里）
+              ...(result.telegram || result.qq ? { savedTo: { telegram: result.telegram, qq: result.qq } } : {})
+            });
           } catch (error) {
             const idx = st.stickerCollectTimes.indexOf(now);
             if (idx >= 0) st.stickerCollectTimes.splice(idx, 1);
@@ -10705,6 +10772,13 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  /** 告诉她在 Telegram 上收藏的东西会存到哪。两个去处都关着就不提收藏。 */
+  function telegramCollectHint() {
+    const sc = cfg.telegram?.stickers ?? {};
+    const places = [sc.favorites === true && tg.stickers ? '你的 Telegram 贴纸包' : '', sc.copyToQQ !== false ? 'QQ 收藏表情（在 QQ 上也能发）' : ''].filter(Boolean);
+    return places.length ? `看到喜欢的贴纸可以用 qq_collect_sticker 收藏，会存进${places.join('，并存一份到')}。` : '';
+  }
+
   /** Telegram 会话的身份说明：和 QQ 是同一个你，但这里只能收发文字和看图。 */
   function telegramIdentityTextV2() {
     const name = tg.me?.first_name || selfDisplayName || '';
@@ -10714,8 +10788,8 @@ async function main() {
       + `消息里 @ 你${id ? `（at 段里是 ${id}）` : ''}、或引用你的消息，指的都是你。`
       + (tg.stickers
         ? `这里能发文字和表情包：qq_send_sticker 发${cfg.telegram.stickers?.favorites ? '你在 Telegram 收藏的贴纸（id 以 tg: 开头）或' : ''} QQ 表情（同步过的发成真贴纸，其余发成图片）。`
-          + (cfg.telegram.stickers?.favorites ? '看到喜欢的贴纸可以用 qq_collect_sticker 收进你的 Telegram 贴纸包。' : '')
         : '这里能发文字和表情包（qq_send_sticker 会以图片发出）。')
+      + telegramCollectHint()
       + '拍一拍、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
   }
 

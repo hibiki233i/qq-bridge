@@ -78,7 +78,8 @@ export function toForm(file) {
       allowGroups: (file.telegram?.allow?.groups ?? []).map(String),
       links: (Array.isArray(file.telegram?.links) ? file.telegram.links : []).map((l) => `${l?.qq ?? ''} = ${l?.telegram ?? ''}`),
       stickerFavorites: file.telegram?.stickers?.favorites === true,
-      stickerSyncQQ: file.telegram?.stickers?.syncQQ === true
+      stickerSyncQQ: file.telegram?.stickers?.syncQQ === true,
+      stickerCopyToQQ: file.telegram?.stickers?.copyToQQ !== false
     }
   };
 }
@@ -184,7 +185,7 @@ export function applyForm(file, form) {
       ownerId: tgOwnerList[0] ?? null,
       allow: { ...(prev.allow ?? {}), private: tgAllowPrivate, groups: tgAllowGroups },
       links,
-      stickers: { ...(prev.stickers ?? {}), favorites: t.stickerFavorites === true, syncQQ: t.stickerSyncQQ === true }
+      stickers: { ...(prev.stickers ?? {}), favorites: t.stickerFavorites === true, syncQQ: t.stickerSyncQQ === true, copyToQQ: t.stickerCopyToQQ !== false }
     };
   }
   return { file: next };

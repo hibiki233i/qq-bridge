@@ -638,7 +638,7 @@ await test('桥接：二代 send-sticker 接口对 Telegram 会话放行；下�
       assert.match(bad.json.error, /不是图片/);
       const collect = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messageId: '1' } });
       assert.equal(collect.status, 500);
-      assert.match(collect.json.error, /收藏贴纸已关闭/, '默认关着，说清楚是关着的');
+      assert.match(collect.json.error, /找不到这条消息/, '收藏默认会存进 QQ 收藏（这里消息 id 不存在）');
     });
     const prompt = h.buildWakePromptV2('private:tg222', 'private');
     assert.match(prompt, /qq_send_sticker 会以图片发出/);
@@ -667,11 +667,11 @@ await test('配置页：Telegram 字段读写与校验', () => {
   assert.ok(!r.errors, JSON.stringify(r.errors));
   assert.deepEqual(r.file.telegram, {
     enabled: true, apiBase: 'http://mirror', pollTimeoutSec: 20, botToken: BOT_TOKEN, proxy: 'http://127.0.0.1:7890',
-    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, links: [], stickers: { favorites: false, syncQQ: false }
+    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, links: [], stickers: { favorites: false, syncQQ: false, copyToQQ: true }
   }, '其余 telegram 字段保留，名单去重存数字');
   const off = applyForm({ ...file, telegram: { ...file.telegram, stickers: { defaultEmoji: '😺' } } },
     { ...f, telegram: { ...f.telegram, botToken: BOT_TOKEN, stickerFavorites: false, stickerSyncQQ: false } });
-  assert.deepEqual(off.file.telegram.stickers, { defaultEmoji: '😺', favorites: false, syncQQ: false }, '两个贴纸开关可以关，其余贴纸配置保留');
+  assert.deepEqual(off.file.telegram.stickers, { defaultEmoji: '😺', favorites: false, syncQQ: false, copyToQQ: true }, '贴纸开关可以关，其余贴纸配置保留');
   const bad = applyForm(file, { ...f, telegram: { enabled: true, botToken: 'nope', proxy: 'socks5://x', ownerId: '-1', allowPrivate: ['-5'], allowGroups: ['abc'] } });
   assert.equal(bad.errors.length, 5, JSON.stringify(bad.errors));
   const none = applyForm({ ownerQQ: 10001, allow: {} }, toForm({ ownerQQ: 10001, allow: {} }));
@@ -725,7 +725,7 @@ await test('贴纸包：包名、emoji、关键词、动图判断、贴纸引用
   assert.throws(() => stickerSetNames('her_bot', 'zz'));
   assert.deepEqual(emojiListFor(['©好 ‼']), ['©\uFE0F', '‼\uFE0F'], '文字样式的符号补上 FE0F');
   const tgDefaults = normalizeTelegramConfig({ enabled: true });
-  assert.deepEqual({ ...tgDefaults.stickers, defaultEmoji: undefined }, { favorites: false, syncQQ: false, defaultEmoji: undefined }, '贴纸包是公开的，默认都关');
+  assert.deepEqual({ ...tgDefaults.stickers, defaultEmoji: undefined }, { favorites: false, syncQQ: false, copyToQQ: true, defaultEmoji: undefined }, '贴纸包是公开的默认关；存进 QQ 收藏不公开，默认开');
   assert.deepEqual(emojiListFor(['好耶🎉 冲', '😀'], '🙂'), ['🎉', '😀']);
   assert.deepEqual(emojiListFor(['没有表情'], 'x'), ['🙂'], '默认 emoji 不是 emoji 时退回 🙂');
   assert.deepEqual(emojiListFor([''], '😺'), ['😺']);
@@ -959,7 +959,7 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
     });
     const prompt = h.buildWakePromptV2('private:tg111', 'private');
     assert.match(prompt, /你在 Telegram 收藏了 1 张贴纸/);
-    assert.match(prompt, /qq_collect_sticker 收进你的 Telegram 贴纸包/);
+    assert.match(prompt, /qq_collect_sticker 收藏，会存进你的 Telegram 贴纸包，并存一份到QQ 收藏表情/);
   } finally { await h.close(); }
 });
 
@@ -1007,7 +1007,9 @@ await test('桥接：贴纸包默认关闭（公开的），不打开就不建',
     fakeTelegram(h);
     h.setupTelegramStickers();
     assert.equal(h.tg.stickers, null);
-    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), '没开收藏就不提收藏');
+    assert.match(h.buildWakePromptV2('private:tg111', 'private'), /qq_collect_sticker 收藏，会存进QQ 收藏表情/, '默认只存 QQ 收藏');
+    h.cfg.telegram.stickers.copyToQQ = false;
+    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), '两个去处都关着就不提收藏');
   } finally { await h.close(); }
 });
 
@@ -1212,6 +1214,86 @@ await test('同一个人：合并的私聊里收藏 Telegram 贴纸进 Telegram 
       const list = await consoleCall(port, '/api/socialV2/sticker-list', { method: 'POST', token: st.agentToken, body: { key: 'private:10001' } });
       assert.equal(list.json.telegramFavorites.length, 1, '会发到 Telegram 时列出 Telegram 收藏');
     });
+  } finally { await h.close(); }
+});
+
+function qqFaceRecorder(h) {
+  const faces = [];
+  h.bot.request = async (action, params) => {
+    if (action === 'add_custom_face') { faces.push(params.file); return { status: 'ok', retcode: 0, data: { emoji_id: `E${faces.length}` } }; }
+    if (action === 'get_version_info') return { status: 'ok', retcode: 0, data: { app_name: 'SnowLuma' } };
+    if (action === 'fetch_custom_face_detail') return { status: 'ok', retcode: 0, data: faces.map((_, i) => ({ emoji_id: `E${i + 1}`, url: `https://public.invalid/${i}` })) };
+    return { status: 'ok', retcode: 0, data: {} };
+  };
+  return faces;
+}
+
+await test('Telegram 上收藏 → 同时存进 QQ 收藏：图片原样存、静态贴纸 / 动画贴纸存图、只开 QQ 时不需要贴纸包', async () => {
+  const h = await bridgeHarness({ config: TG_CONFIG });
+  try {
+    const faces = qqFaceRecorder(h);
+    h.tg.client = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
+    h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
+    h.setMode('reserved2');
+    const send = async (message) => {
+      const r = updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, ...message }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+      await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    };
+    await send({ message_id: 71, photo: [{ file_id: 'PHOTOxxxxxxxx', file_size: 100 }] });
+    await send({ message_id: 72, sticker: { file_id: 'CAACAgIAAxkBAAF7', file_unique_id: 'AgAD72', is_animated: true, is_video: false, emoji: '🐱', thumbnail: { file_id: 'THUMB72xxxxxxxx' } } });
+    const st = h.getSocialV2State('private:tg222');
+    await withServer(h, async (port) => {
+      for (const id of ['71', '72']) {
+        const res = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messageId: id, remark: '好玩' } });
+        assert.equal(res.status, 200, res.body);
+        assert.equal(res.json.savedTo.qq.ok, true);
+        assert.equal(res.json.savedTo.telegram, null, '贴纸包没开就不去');
+      }
+    });
+    assert.equal(faces.length, 2);
+    assert.ok(faces.every((f) => Buffer.from(f.replace('base64://', ''), 'base64').subarray(1, 4).toString() === 'PNG'), '存进 QQ 的是 PNG 图片');
+    assert.ok(botApi.calls.some((c) => c.method === 'getFile' && c.params.file_id === 'THUMB72xxxxxxxx'), '动画贴纸存的是缩略图');
+  } finally { await h.close(); }
+});
+
+await test('Telegram 上收藏视频贴纸 → QQ 收藏里是 GIF（真 ffmpeg）；只成功一边时说明另一边为什么失败', async () => {
+  if (spawnSync('ffmpeg', ['-version']).status !== 0) { console.log('  （本机没有 ffmpeg，跳过）'); return; }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-qq-'));
+  spawnSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=20', '-t', '2', path.join(tmp, 'b.gif')]);
+  const webm = (await convertToSticker(fs.readFileSync(path.join(tmp, 'b.gif')), { tmpRoot: tmp })).buffer;
+  const h = await bridgeHarness({ config: { telegram: { ...TG_CONFIG.telegram, stickers: { favorites: true } } } });
+  try {
+    const faces = qqFaceRecorder(h);
+    const downloads = [];
+    h.tg.client = { downloadFile: async (id) => { downloads.push(id); return id === 'CAACAgIAAxkBAAF8' ? webm : PNG; }, redact: (x) => x };
+    h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
+    h.setMode('reserved2');
+    const r = updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, message_id: 73,
+      sticker: { file_id: 'CAACAgIAAxkBAAF8', file_unique_id: 'AgAD73', is_animated: false, is_video: true, emoji: '🎉', thumbnail: { file_id: 'THUMB73xxxxxxxx' } } }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const st = h.getSocialV2State('private:tg222');
+    await withServer(h, async (port) => {
+      const res = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messageId: '73' } });
+      assert.equal(res.status, 200, res.body);
+      assert.equal(res.json.savedTo.telegram.ok, false, '贴纸包没准备好（这里没配管理器）');
+      assert.match(res.json.savedTo.telegram.error, /没准备好/);
+      assert.equal(res.json.savedTo.qq.ok, true);
+    });
+    assert.ok(downloads.includes('CAACAgIAAxkBAAF8'), '视频贴纸下载的是贴纸本身，不是缩略图');
+    const gif = Buffer.from(faces[0].replace('base64://', ''), 'base64');
+    assert.equal(gif.subarray(0, 6).toString(), 'GIF89a', 'QQ 收藏里是 GIF');
+    assert.ok(isAnimatedGif(gif), '而且会动');
+  } finally {
+    await h.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+await test('Telegram 上收藏：两个去处都关着时直接说明', async () => {
+  const h = await bridgeHarness({ config: { telegram: { ...TG_CONFIG.telegram, stickers: { favorites: false, copyToQQ: false } } } });
+  try {
+    fakeTelegram(h);
+    await assert.rejects(h.collectTelegramStickerV2('private:tg222', '1', ''), /都关着/);
   } finally { await h.close(); }
 });
 

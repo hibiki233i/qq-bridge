@@ -123,6 +123,8 @@ export function normalizeTelegramConfig(raw) {
     stickers: {
       favorites: t.stickers?.favorites === true,
       syncQQ: t.stickers?.syncQQ === true,
+      // Telegram 上收藏时同时存一份进 QQ 收藏表情（存在 bot 自己的 QQ 号里，不公开），默认开
+      copyToQQ: t.stickers?.copyToQQ !== false,
       defaultEmoji: String(t.stickers?.defaultEmoji ?? '🙂').slice(0, 16) || '🙂'
     }
   };
