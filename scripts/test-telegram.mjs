@@ -23,6 +23,7 @@ import {
   createTgStickerManager, loadTgStickerStore, SET_LIMIT, convertToSticker
 } from '../src/tg-stickers.js';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let failures = 0;
@@ -1217,14 +1218,21 @@ await test('同一个人：合并的私聊里收藏 Telegram 贴纸进 Telegram 
   } finally { await h.close(); }
 });
 
-function qqFaceRecorder(h) {
+function qqFaceRecorder(h, { impl = 'SnowLuma' } = {}) {
   const faces = [];
+  const md5s = [];
   h.bot.request = async (action, params) => {
-    if (action === 'add_custom_face') { faces.push(params.file); return { status: 'ok', retcode: 0, data: { emoji_id: `E${faces.length}` } }; }
-    if (action === 'get_version_info') return { status: 'ok', retcode: 0, data: { app_name: 'SnowLuma' } };
-    if (action === 'fetch_custom_face_detail') return { status: 'ok', retcode: 0, data: faces.map((_, i) => ({ emoji_id: `E${i + 1}`, url: `https://public.invalid/${i}` })) };
+    if (action === 'add_custom_face') {
+      const bytes = String(params.file).startsWith('base64://') ? Buffer.from(params.file.slice(9), 'base64') : fs.readFileSync(params.file);
+      faces.push(params.file);
+      md5s.push(crypto.createHash('md5').update(bytes).digest('hex').toUpperCase());
+      return { status: 'ok', retcode: 0, data: impl === 'NapCat.Onebot' ? {} : { emoji_id: `E${faces.length}` } };
+    }
+    if (action === 'get_version_info') return { status: 'ok', retcode: 0, data: { app_name: impl } };
+    if (action === 'fetch_custom_face_detail') return { status: 'ok', retcode: 0, data: md5s.map((m, i) => ({ emoji_id: `E${i + 1}`, md5: m, url: `https://public.invalid/${i}` })) };
     return { status: 'ok', retcode: 0, data: {} };
   };
+  faces.md5s = md5s;
   return faces;
 }
 
@@ -1287,6 +1295,48 @@ await test('Telegram 上收藏视频贴纸 → QQ 收藏里是 GIF（真 ffmpeg�
     await h.close();
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+await test('Telegram 收藏过来的 QQ 表情不再被「QQ 表情同步」传回 Telegram；NapCat 临时文件放在随机私有目录', async () => {
+  const h = await bridgeHarness({ config: { telegram: { ...TG_CONFIG.telegram, stickers: { syncQQ: true } } } });
+  try {
+    const faces = qqFaceRecorder(h, { impl: 'NapCat.Onebot' });
+    faces.md5s.push('B'.repeat(32)); // QQ 里本来就有的一张
+    h.tg.client = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
+    h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
+    h.setMode('reserved2');
+    const r = updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, message_id: 81, photo: [{ file_id: 'PHOTO81xxxxxxxx', file_size: 100 }] }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const res = await h.collectTelegramStickerV2('private:tg222', '81', '');
+    assert.equal(res.qq.ok, true);
+    const napcatPath = faces[0];
+    assert.ok(napcatPath.startsWith(os.tmpdir()) || napcatPath.startsWith(fs.realpathSync(os.tmpdir())), napcatPath);
+    assert.match(path.basename(path.dirname(napcatPath)), /^qq-bridge-faces-\w{6}$/, '随机名字的私有目录');
+    assert.ok(!fs.existsSync(path.dirname(napcatPath)), '用完就删');
+    let seen = null;
+    h.tg.stickers = { syncQq: async (entries) => { seen = entries; return { added: 0, removed: 0, failed: 0, skipped: 0, gaveUp: 0 }; } };
+    await h.runQqStickerSync();
+    assert.ok(seen, '同步跑了');
+    assert.deepEqual([...seen.map((e) => e.md5)], ['B'.repeat(32)], 'Telegram 来的那张被跳过，QQ 原有的照常同步');
+  } finally { await h.close(); }
+});
+
+await test('视频贴纸转不了 GIF（比如 ffmpeg 没带 libvpx）时改存缩略图', async () => {
+  const h = await bridgeHarness({ config: TG_CONFIG });
+  try {
+    const faces = qqFaceRecorder(h);
+    const downloads = [];
+    h.tg.client = { downloadFile: async (id) => { downloads.push(id); return id === 'CAACAgIAAxkBAAF9' ? Buffer.from('not a webm at all') : PNG; }, redact: (x) => x };
+    h.tg.me = { id: 7000, username: 'her_bot', first_name: '小鲸鱼' };
+    h.setMode('reserved2');
+    const r = updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, message_id: 82,
+      sticker: { file_id: 'CAACAgIAAxkBAAF9', file_unique_id: 'AgAD82', is_video: true, is_animated: false, emoji: '🙃', thumbnail: { file_id: 'THUMB82xxxxxxxx' } } }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const res = await h.collectTelegramStickerV2('private:tg222', '82', '');
+    assert.equal(res.qq.ok, true, JSON.stringify(res));
+    assert.deepEqual(downloads, ['CAACAgIAAxkBAAF9', 'THUMB82xxxxxxxx']);
+    assert.equal(Buffer.from(faces[0].replace('base64://', ''), 'base64').subarray(1, 4).toString(), 'PNG');
+  } finally { await h.close(); }
 });
 
 await test('Telegram 上收藏：两个去处都关着时直接说明', async () => {

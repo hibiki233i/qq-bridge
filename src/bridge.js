@@ -74,6 +74,8 @@ const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 // 她在 Telegram 上的两个贴纸包（收藏 / QQ 同步）的本地记录
 const TG_STICKER_FILE = path.join(STATE_DIR, 'telegram-stickers.json');
+// 从 Telegram 收藏过来、存进 QQ 收藏表情的那些（md5 列表）；「QQ 表情同步」跳过它们
+const TG_ORIGIN_FACES_FILE = path.join(STATE_DIR, 'telegram-origin-faces.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
@@ -2250,6 +2252,7 @@ async function main() {
         const face = await telegramMediaForQQ(media, ref, image);
         assertSendAllowed();
         const added = await addFaceToQQ(face, note, assertSendAllowed);
+        rememberTelegramOriginFace(added.md5);
         result.qq = { ok: true, id: added.emojiId };
         if (!result.entry) { result.entry = added.entry; result.emojiId = added.emojiId; }
       } catch (error) {
@@ -2262,6 +2265,30 @@ async function main() {
     return result;
   }
 
+  /**
+   * 从 Telegram 收藏过来的 QQ 表情记一笔（md5），「QQ 表情同步」跳过它们：
+   * 不然它会被转成低画质贴纸再传回 Telegram 贴纸包，同一张占两个包的名额。
+   */
+  function loadTelegramOriginFaces() {
+    const list = readJsonSafe(TG_ORIGIN_FACES_FILE, []);
+    return new Set((Array.isArray(list) ? list : []).map((x) => String(x).toUpperCase()).filter((x) => /^[0-9A-F]{32}$/.test(x)));
+  }
+  function rememberTelegramOriginFace(md5) {
+    const m = String(md5 ?? '').toUpperCase();
+    if (!/^[0-9A-F]{32}$/.test(m)) return;
+    const set = loadTelegramOriginFaces();
+    if (set.has(m)) return;
+    set.add(m);
+    try { atomicWriteJson(TG_ORIGIN_FACES_FILE, [...set].slice(-2000)); } catch (error) { log(`记录 Telegram 来源表情失败：${error?.message ?? error}`); }
+  }
+
+  // ffmpeg 能不能用：检查一次记住结果（spawnSync 会卡住事件循环，不能每次收藏都查）
+  const ffmpegChecks = new Map();
+  function ffmpegReady(ffmpeg) {
+    if (!ffmpegChecks.has(ffmpeg)) ffmpegChecks.set(ffmpeg, ffmpegAvailable(ffmpeg));
+    return ffmpegChecks.get(ffmpeg);
+  }
+
   /** Telegram 上的贴纸 / 图片 → 能存进 QQ 收藏表情的图片字节。 */
   async function telegramMediaForQQ(media, ref, image) {
     if (!tg.client) throw new Error('Telegram 未连接');
@@ -2271,8 +2298,16 @@ async function main() {
     if (image) {
       buf = image;
     } else if (ref.format === 'video') {
-      buf = await tg.client.downloadFile(ref.fileId, MAX_MEDIA_BYTES);
-      format = 'video';
+      if (ffmpegReady(ffmpeg)) {
+        try {
+          const webm = await tg.client.downloadFile(ref.fileId, MAX_MEDIA_BYTES);
+          return await convertStickerForQQ(webm, 'video', { ffmpeg, maxBytes: MAX_MEDIA_BYTES });
+        } catch (error) {
+          // 比如 ffmpeg 没带 libvpx 解不了：退而存它的静态缩略图
+          log(`[sticker] 视频贴纸转 GIF 失败，改存缩略图：${error?.message ?? error}`);
+        }
+      }
+      buf = await tg.client.downloadFile(String(media.file).slice('tgfile:'.length), MAX_MEDIA_BYTES);
     } else {
       // 静态贴纸：media.file 就是它本身（WEBP）；矢量动画贴纸：media.file 是它的缩略图
       buf = await tg.client.downloadFile(String(media.file).slice('tgfile:'.length), MAX_MEDIA_BYTES);
@@ -2280,7 +2315,7 @@ async function main() {
     const ext = sniffImageExt(buf);
     // QQ 认 PNG / JPG / GIF；已经是这几种的图片不用转（也就不依赖 ffmpeg）
     if (format === 'static' && looksLikeImageBuffer(buf) && ext !== 'webp') return buf;
-    if (!ffmpegAvailable(ffmpeg)) throw new Error('找不到 ffmpeg，Telegram 贴纸转不成 QQ 能用的图片');
+    if (!ffmpegReady(ffmpeg)) throw new Error('找不到 ffmpeg，Telegram 贴纸转不成 QQ 能用的图片');
     return convertStickerForQQ(buf, format, { ffmpeg, maxBytes: MAX_MEDIA_BYTES });
   }
 
@@ -2331,17 +2366,18 @@ async function main() {
     if (impl === 'napcat') {
       // NapCat 的 add_custom_face 只认本地路径（直接 stat/readFile，不解析 base64://），也不回 emoji_id。
       // 字节是桥接自己取到并校验过的，落到私有临时目录再交给它；NapCat 与桥接需在同一台机器上。
-      const tmpDir = path.join(os.tmpdir(), 'qq-bridge-faces');
-      fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
-      const tmpFile = path.join(tmpDir, `${md5}.${sniffImageExt(faceBuffer)}`);
-      fs.writeFileSync(tmpFile, faceBuffer, { mode: 0o600 });
+      // 每次用 mkdtemp 建一个随机名字的私有目录：固定目录 + 按 md5 命名的文件名可以被别人预先放好符号链接
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-bridge-faces-'));
       try {
+        try { fs.chmodSync(tmpDir, 0o700); } catch {}
+        const tmpFile = path.join(tmpDir, `${md5}.${sniffImageExt(faceBuffer)}`);
+        fs.writeFileSync(tmpFile, faceBuffer, { mode: 0o600, flag: 'wx' });
         const addRes = await bot.request('add_custom_face', { file: tmpFile });
         if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
           throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
         }
       } finally {
-        try { fs.unlinkSync(tmpFile); } catch {}
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       }
     } else {
       const addRes = await bot.request('add_custom_face', { file });
@@ -2377,7 +2413,7 @@ async function main() {
         }
       }
     }
-    return { emojiId, entry: entry || null, remark: cleanRemark };
+    return { emojiId, entry: entry || null, remark: cleanRemark, md5 };
   }
 
   function saveSlangStore() {
@@ -2803,7 +2839,9 @@ async function main() {
     qqStickerSyncRunning = true;
     try {
       const synced = await syncStickerLibrary(false);
-      const entries = synced?.entries ?? [];
+      // 从 Telegram 收藏过来的不再同步回去
+      const fromTelegram = loadTelegramOriginFaces();
+      const entries = (synced?.entries ?? []).filter((e) => !fromTelegram.has(String(e?.md5 ?? '').toUpperCase()));
       // QQ 表情库拿不到（网关没连上 / 刚启动还没同步过）时别动包：空列表会被当成「全删了」
       if (!entries.length) return null;
       const r = await tg.stickers.syncQq(entries, async (entry) => {

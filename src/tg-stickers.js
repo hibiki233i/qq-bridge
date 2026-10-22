@@ -197,10 +197,12 @@ export async function convertStickerForQQ(buffer, format, { ffmpeg = 'ffmpeg', t
       const input = path.join(dir, 'in.webm');
       fs.writeFileSync(input, buffer, { mode: 0o600 });
       const out = path.join(dir, 'out.gif');
-      // 指定 libvpx-vp9 解码器才能读到透明通道
-      const r = await runFfmpeg(ffmpeg, ['-v', 'error', '-y', '-c:v', 'libvpx-vp9', '-i', input, '-t', '3',
+      const gifArgs = ['-t', '3',
         '-vf', 'fps=15,scale=240:240:force_original_aspect_ratio=decrease:flags=lanczos,split[a][b];[b]palettegen=reserve_transparent=1[p];[a][p]paletteuse',
-        '-loop', '0', out]);
+        '-loop', '0', out];
+      // 指定 libvpx-vp9 解码器才能读到透明通道；ffmpeg 没带 libvpx 时退回自带解码器（透明背景会变成实底）
+      let r = await runFfmpeg(ffmpeg, ['-v', 'error', '-y', '-c:v', 'libvpx-vp9', '-i', input, ...gifArgs]);
+      if (!r.ok) r = await runFfmpeg(ffmpeg, ['-v', 'error', '-y', '-i', input, ...gifArgs]);
       if (!r.ok) throw new Error(r.error);
       const bytes = fs.readFileSync(out);
       if (bytes.length > maxBytes) throw new Error('转出来的 GIF 太大');
