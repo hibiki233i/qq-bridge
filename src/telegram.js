@@ -9,6 +9,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
+import crypto from 'node:crypto';
+import { sniffImageExt } from './onebot-impl.js';
 
 const TG_CONV_ID_RE = /^tg(-?\d+)$/;
 const BOT_TOKEN_RE = /^\d{5,}:[A-Za-z0-9_-]{30,}$/;
@@ -139,19 +141,19 @@ function openTunnel(proxyUrl, host, port, signal) {
  * 发一个 HTTP 请求，返回 { status, buffer }。
  * maxBytes 超限直接中断（防止被一个超大响应撑爆内存）。
  */
-export async function telegramHttp(url, { method = 'GET', json, proxy = '', timeoutMs = 20000, maxBytes = MAX_JSON_BYTES, signal } = {}) {
+export async function telegramHttp(url, { method = 'GET', json, body: rawBody, contentType, proxy = '', timeoutMs = 20000, maxBytes = MAX_JSON_BYTES, signal } = {}) {
   const target = new URL(url);
   const isHttps = target.protocol === 'https:';
   const port = Number(target.port) || (isHttps ? 443 : 80);
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-  const body = json === undefined ? null : Buffer.from(JSON.stringify(json));
+  const body = rawBody ?? (json === undefined ? null : Buffer.from(JSON.stringify(json)));
   const options = {
     method,
     hostname: target.hostname,
     port,
     path: target.pathname + target.search,
-    headers: body ? { 'content-type': 'application/json', 'content-length': body.length } : {},
+    headers: body ? { 'content-type': contentType || 'application/json', 'content-length': body.length } : {},
     signal: combined
   };
   if (proxy) {
@@ -182,6 +184,29 @@ export async function telegramHttp(url, { method = 'GET', json, proxy = '', time
   });
 }
 
+/**
+ * 拼一个 multipart/form-data 请求体：普通字段 + 一个文件。
+ * 字段名和文件名都是代码里写死的，不接收外部输入，所以不用转义。
+ */
+export function buildMultipart(fields, file) {
+  const boundary = `----qqbridge${crypto.randomBytes(12).toString('hex')}`;
+  const parts = [];
+  for (const [name, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
+    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${text}\r\n`));
+  }
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`));
+  parts.push(file.buffer);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return { body: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+const IMAGE_MIME = { gif: 'image/gif', png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp' };
+// Bot API：上传的照片最大 10 MB，动图（sendAnimation）最大 50 MB
+const MAX_PHOTO_UPLOAD = 10 * 1024 * 1024;
+const UPLOAD_TIMEOUT_MS = 30000;
+
 export class TelegramApiError extends Error {
   constructor(message, code, retryAfter) {
     super(message);
@@ -206,11 +231,14 @@ export class TelegramClient {
     return this.token ? s.split(this.token).join('***') : s;
   }
 
-  async call(method, params = {}, { timeoutMs = 20000, signal, retried = false } = {}) {
+  async call(method, params = {}, { timeoutMs = 20000, signal, retried = false, file = null } = {}) {
     let res;
     try {
+      const payload = file ? buildMultipart(params, file) : null;
       res = await telegramHttp(`${this.apiBase}/bot${this.token}/${method}`, {
-        method: 'POST', json: params, proxy: this.proxy, timeoutMs, signal
+        method: 'POST',
+        ...(payload ? { body: payload.body, contentType: payload.contentType } : { json: params }),
+        proxy: this.proxy, timeoutMs, signal
       });
     } catch (error) {
       throw new TelegramApiError(this.redact(`Telegram ${method} 网络错误：${error?.message ?? error}`), 'network');
@@ -221,9 +249,9 @@ export class TelegramClient {
     const code = body?.error_code ?? res.status;
     const retryAfter = Number(body?.parameters?.retry_after) || 0;
     // 发太快被限流：等得不久就原地重试一次，等得久就交给调用方处理。
-    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= (method === 'sendMessage' ? MAX_INLINE_RETRY_SEC : 15)) {
+    if (code === 429 && !retried && retryAfter > 0 && retryAfter <= (method.startsWith('send') ? MAX_INLINE_RETRY_SEC : 15)) {
       await sleep(retryAfter * 1000);
-      return this.call(method, params, { timeoutMs, signal, retried: true });
+      return this.call(method, params, { timeoutMs, signal, retried: true, file });
     }
     const desc = body?.description || `HTTP ${res.status}`;
     throw new TelegramApiError(this.redact(`Telegram ${method} 失败：${desc}`), code, retryAfter);
@@ -273,6 +301,28 @@ export class TelegramClient {
       last = await this.call('sendMessage', params, { timeoutMs: SEND_TIMEOUT_MS });
     }
     return last;
+  }
+
+  /**
+   * 发一张图片（上传字节）。GIF 用 sendAnimation 才会动，其它格式用 sendPhoto。
+   * mention 放在图片说明里（text_mention），图片本身不带别的文字。
+   */
+  async sendImage(chatId, buffer, { replyTo = null, mention = null, threadId = null } = {}) {
+    const ext = sniffImageExt(buffer);
+    const animated = ext === 'gif';
+    if (!animated && buffer.length > MAX_PHOTO_UPLOAD) throw new Error(`图片 ${buffer.length} 字节，超过 Telegram 照片上传上限 10 MB`);
+    const params = { chat_id: chatId };
+    if (mention && mention.userId && mention.name) {
+      params.caption = String(mention.name);
+      params.caption_entities = [{ type: 'text_mention', offset: 0, length: params.caption.length, user: { id: Number(mention.userId) } }];
+    }
+    if (replyTo) params.reply_parameters = { message_id: Number(replyTo), allow_sending_without_reply: true };
+    if (threadId) params.message_thread_id = Number(threadId);
+    const field = animated ? 'animation' : 'photo';
+    return await this.call(animated ? 'sendAnimation' : 'sendPhoto', params, {
+      timeoutMs: UPLOAD_TIMEOUT_MS,
+      file: { field, filename: `sticker.${ext}`, contentType: IMAGE_MIME[ext] ?? 'application/octet-stream', buffer }
+    });
   }
 
   /** 下载一个文件（图片）；超过 maxBytes 直接拒绝。 */

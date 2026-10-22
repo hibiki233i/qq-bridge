@@ -31,13 +31,38 @@ const BOT_TOKEN = '123456:' + 'A'.repeat(35);
 const ME = { id: 7000, is_bot: true, first_name: '小鲸鱼', username: 'her_bot', can_read_all_group_messages: false };
 // 1x1 PNG 的头部（签名 + IHDR），够 looksLikeImageBuffer / getImageDimensions 用
 const PNG = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+const GIF = Buffer.concat([Buffer.from('GIF89a'), Buffer.from([1, 0, 1, 0, 0, 0, 0]), Buffer.alloc(20)]);
+
+/** 极简 multipart 解析：够测试用（字段名 → 文本，文件 → { filename, contentType, buffer }） */
+function parseMultipart(buf, contentType) {
+  const boundary = /boundary=(.+)$/.exec(contentType)[1];
+  const out = {};
+  const sep = Buffer.from(`--${boundary}`);
+  let pos = buf.indexOf(sep);
+  while (pos >= 0) {
+    const next = buf.indexOf(sep, pos + sep.length);
+    if (next < 0) break;
+    const part = buf.subarray(pos + sep.length + 2, next - 2);
+    const headEnd = part.indexOf('\r\n\r\n');
+    const head = part.subarray(0, headEnd).toString();
+    const body = part.subarray(headEnd + 4);
+    const name = /name="([^"]+)"/.exec(head)[1];
+    const filename = /filename="([^"]+)"/.exec(head)?.[1];
+    out[name] = filename ? { filename, contentType: /Content-Type: (.+)/.exec(head)[1], buffer: Buffer.from(body) } : body.toString();
+    pos = next;
+  }
+  return out;
+}
 const NOW = 1_800_000_000;
 
 // ── 假 Bot API ──────────────────────────────────────────────────────────
 const botApi = { calls: [], updates: [], rateLimitOnce: true };
 const apiServer = http.createServer((req, res) => {
-  let raw = '';
-  req.on('data', (c) => { raw += c; }).on('end', async () => {
+  const chunks = [];
+  req.on('data', (c) => { chunks.push(c); }).on('end', async () => {
+    const rawBuf = Buffer.concat(chunks);
+    const isMultipart = String(req.headers['content-type'] ?? '').startsWith('multipart/form-data');
+    const raw = isMultipart ? '' : rawBuf.toString();
     const reply = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     const fileMatch = /^\/file\/bot([^/]+)\/(.+)$/.exec(req.url);
     if (fileMatch) {
@@ -48,7 +73,7 @@ const apiServer = http.createServer((req, res) => {
     }
     const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url);
     if (!m) return reply(404, { ok: false, error_code: 404, description: 'Not Found' });
-    const params = raw ? JSON.parse(raw) : {};
+    const params = isMultipart ? parseMultipart(rawBuf, req.headers['content-type']) : (raw ? JSON.parse(raw) : {});
     botApi.calls.push({ method: m[2], params });
     if (m[1] !== BOT_TOKEN) return reply(401, { ok: false, error_code: 401, description: 'Unauthorized' });
     switch (m[2]) {
@@ -63,6 +88,9 @@ const apiServer = http.createServer((req, res) => {
           return reply(429, { ok: false, error_code: 429, description: 'Too Many Requests: retry after 1', parameters: { retry_after: 1 } });
         }
         return reply(200, { ok: true, result: { message_id: 500 + botApi.calls.length, chat: { id: params.chat_id }, text: params.text } });
+      case 'sendPhoto':
+      case 'sendAnimation':
+        return reply(200, { ok: true, result: { message_id: 700 + botApi.calls.length, chat: { id: Number(params.chat_id) } } });
       case 'getFile':
         if (params.file_id === 'big') return reply(200, { ok: true, result: { file_id: 'big', file_size: 50 * 1024 * 1024, file_path: 'photos/big.png' } });
         if (params.file_id === 'evil') return reply(200, { ok: true, result: { file_id: 'evil', file_path: '../../etc/passwd' } });
@@ -246,6 +274,29 @@ await test('发文字：引用、@ 实体、超长切分；429 等一下重试�
   assert.ok(Date.now() - t0 >= 900, '按 retry_after 等待');
 });
 
+await test('发图：PNG 用 sendPhoto、GIF 用 sendAnimation（multipart 上传），@ 放在图片说明里', async () => {
+  const c = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
+  botApi.calls.length = 0;
+  await c.sendImage(-100500, PNG, { replyTo: 9, threadId: 40, mention: { userId: 222, name: 'Alice' } });
+  const photo = botApi.calls.find((x) => x.method === 'sendPhoto');
+  assert.ok(photo, '应当调用 sendPhoto');
+  assert.equal(photo.params.chat_id, '-100500');
+  assert.deepEqual(photo.params.photo.buffer, PNG, '上传的就是这张图的字节');
+  assert.equal(photo.params.photo.contentType, 'image/png');
+  assert.equal(photo.params.caption, 'Alice');
+  assert.deepEqual(JSON.parse(photo.params.caption_entities), [{ type: 'text_mention', offset: 0, length: 5, user: { id: 222 } }]);
+  assert.deepEqual(JSON.parse(photo.params.reply_parameters), { message_id: 9, allow_sending_without_reply: true });
+  assert.equal(photo.params.message_thread_id, '40');
+  botApi.calls.length = 0;
+  const sent = await c.sendImage(111, GIF);
+  const anim = botApi.calls.find((x) => x.method === 'sendAnimation');
+  assert.ok(anim, 'GIF 走 sendAnimation 才会动');
+  assert.equal(anim.params.animation.filename, 'sticker.gif');
+  assert.equal(anim.params.caption, undefined, '没 @ 人就不带说明文字');
+  assert.ok(sent.message_id > 0);
+  await assert.rejects(c.sendImage(111, Buffer.concat([PNG, Buffer.alloc(10 * 1024 * 1024)])), /10 MB/);
+});
+
 await test('下载图片：大小上限、路径校验；错误信息里没有 token', async () => {
   const c = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE });
   const buf = await c.downloadFile('ok', 1024 * 1024);
@@ -418,7 +469,9 @@ await test('桥接：Telegram 群里叫 bot 的名字能唤醒（不是 QQ 昵�
     st.wakeConfig.triggers = { nameMention: true };
     assert.equal(h.evaluateWakeTriggerV2('group:tg-100500', st, event, 'group', '小樰你觉得呢', '小樰你觉得呢', false), 'nameMention');
     const qqEvent = { self_id: '10001', user_id: '5', message: [] };
-    assert.equal(h.evaluateWakeTriggerV2('group:456', h.getSocialV2State('group:456'), qqEvent, 'group', '小樰', '小樰', false), null, 'QQ 群仍按 QQ 昵称');
+    const qqSt = h.getSocialV2State('group:456');
+    qqSt.wakeConfig.triggers = { nameMention: true }; // 只留名字触发：默认配置带随机概率，会让结果不稳定
+    assert.equal(h.evaluateWakeTriggerV2('group:456', qqSt, qqEvent, 'group', '小樰', '小樰', false), null, 'QQ 群仍按 QQ 昵称');
   } finally { await h.close(); }
 });
 
@@ -484,6 +537,54 @@ await test('桥接：二代模式 Telegram 会话能入库、能发送，QQ 专�
       assert.equal(wrongToken.status, 403, 'QQ 会话的令牌不能发到 Telegram 会话');
     });
     assert.equal(h.calls.sent.length, 0, '全程没有发到 QQ');
+  } finally { await h.close(); }
+});
+
+await test('桥接：表情包工具在 Telegram 会话里发成图片，不走 QQ 网关', async () => {
+  const qqHttp = [];
+  const h = await bridgeHarness({ config: TG_CONFIG, globals: {
+    safeFetchBuffer: async () => ({ buffer: GIF }),
+    fetch: async (url, init) => { qqHttp.push(String(url)); return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { message_id: 1 } }) }; }
+  } });
+  try {
+    const calls = fakeTelegram(h);
+    h.tg.client.sendImage = async (chatId, buffer, opts) => { calls.push({ image: true, chatId, buffer, opts }); return { message_id: 777 }; };
+    h.tg.cache.rememberName(-100500, 'tg222', 'Alice W');
+    const sent = await h.sendStickerV2('group:tg-100500', 'fixture-sticker', { replyToMessageId: 9, atUserId: 'tg222' });
+    const img = calls.find((c) => c.image);
+    assert.equal(img.chatId, -100500);
+    assert.ok(Buffer.from(img.buffer).equals(GIF), '发的是下载到的表情字节');
+    assert.equal(img.opts.replyTo, 9);
+    assert.deepEqual({ ...img.opts.mention }, { userId: 222, name: 'Alice W' });
+    assert.equal(sent.messageId, 777);
+    assert.ok(!qqHttp.some((u) => /send_(group|private)_msg/.test(u)), '不能发到 QQ');
+    const info = await h.resolveReplyInfo('group', 'tg-100500', '777', 'tg7000');
+    assert.match(info.text, /^\[表情包:/, '别人引用这张表情时知道是她发的表情包');
+    await assert.rejects(h.sendStickerV2('group:tg-100500', 'fixture-sticker', { atUserId: 'abc' }), /atUserId/, '@ 的不是 Telegram 用户 id 就拒绝');
+  } finally { await h.close(); }
+});
+
+await test('桥接：二代 send-sticker 接口对 Telegram 会话放行；下载到的不是图片就拒绝', async () => {
+  let payload = GIF;
+  const h = await bridgeHarness({ config: TG_CONFIG, globals: { safeFetchBuffer: async () => ({ buffer: payload }) } });
+  try {
+    const calls = fakeTelegram(h);
+    h.tg.client.sendImage = async (chatId, buffer) => { calls.push({ image: true, chatId }); return { message_id: 778 }; };
+    h.setMode('reserved2');
+    const st = h.getSocialV2State('private:tg222');
+    await withServer(h, async (port) => {
+      const ok = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', stickerId: 'fixture-sticker' } });
+      assert.equal(ok.status, 200, ok.body);
+      assert.equal(calls.filter((c) => c.image).length, 1);
+      payload = Buffer.from('<html>not an image</html>');
+      const bad = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', stickerId: 'fixture-sticker' } });
+      assert.equal(bad.status, 500);
+      assert.match(bad.json.error, /不是图片/);
+      const collect = await consoleCall(port, '/api/socialV2/collect-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messageId: '1' } });
+      assert.equal(collect.status, 400, '收藏表情仍是 QQ 专有');
+    });
+    const prompt = h.buildWakePromptV2('private:tg222', 'private');
+    assert.match(prompt, /qq_send_sticker 会以图片发出/);
   } finally { await h.close(); }
 });
 

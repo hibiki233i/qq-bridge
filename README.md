@@ -127,7 +127,7 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 - 收消息用长轮询（getUpdates），不需要公网地址；国内直连不通，`proxy` 填本机 HTTP 代理。
 - 名单和 QQ 的分开存；名单为空就谁也不理（不跟随 `allowAllWhenEmpty`）。`ownerId` 的私聊总是放行，也能用 `/reset` 等管理命令；封闭 agent 模式（closed-agent）仍只认 QQ 管理员。
 - 不知道 id：先启用并启动桥接，给 bot 发一句话，日志里「忽略未授权会话 private:tg123…」里 `tg` 后面的数字就是。
-- 目前支持文字和图片（收图给模型看、发文字、引用、@）。拍一拍、QQ 表情包、语音、合并转发只在 QQ 上有，Telegram 会话调用这些工具会直接返回"不支持"。
+- 支持文字和图片：收图给模型看，发文字、引用、@；`qq_send_sticker` 在 Telegram 会话里把 QQ 收藏表情以图片发出（GIF 用 sendAnimation，会动）。拍一拍、语音、收藏表情、合并转发只在 QQ 上有，Telegram 会话调用这些工具会直接返回"不支持"。
 - 想让她看到群里所有消息，要在 @BotFather 里 `/setprivacy` → Disable，再把 bot 移出群重新拉进来。
 - 桥接停机期间积压超过 10 分钟的 Telegram 消息，重启后不再回复。
 

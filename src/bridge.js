@@ -1222,7 +1222,7 @@ function log(...args) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
-const TELEGRAM_UNSUPPORTED = 'Telegram 会话不支持这个操作（拍一拍、语音、QQ 表情包、合并转发只有 QQ 有）';
+const TELEGRAM_UNSUPPORTED = 'Telegram 会话不支持这个操作（拍一拍、语音、收藏表情、合并转发只有 QQ 有）';
 const SEND_TIMEOUT_MS = 15000;
 // DSH 控制类调用（停任务/归档会话）的超时。这些 await 以前是裸的：DSH 接受了连接但
 // 不返回响应时，HTTP handler 永不返回，控制台与群消息一起失去响应（issue #32）。
@@ -1932,7 +1932,7 @@ async function main() {
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
-    if (parseConvKey(key)?.telegram) throw new Error(TELEGRAM_UNSUPPORTED);
+    const onTelegram = parseConvKey(key)?.telegram === true;
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
@@ -1949,9 +1949,11 @@ async function main() {
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+      if (onTelegram && Number(rid) <= 0) throw new Error('Telegram 的 replyToMessageId 必须是正整数');
       segments.push({ type: 'reply', data: { id: rid } });
     }
-    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+    // Telegram 的 @ 由 telegramSendImage 校验（tg 开头的用户 id），这里只校验 QQ 号
+    if (!onTelegram && atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
       const at = String(atUserId).trim();
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
@@ -1963,22 +1965,33 @@ async function main() {
     } catch (error) {
       throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
     }
+    // Telegram 要按图片格式选接口（GIF 走 sendAnimation），不是图片的字节别往上传
+    if (onTelegram && !looksLikeImageBuffer(image.buffer)) throw new Error(`表情 ${entry.id} 下载到的不是图片`);
     segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
+    // 与文本发送共用同一条发送队列（QQ、Telegram 各一条），保证“先文字后表情”的真人顺序不被并发工具调用打乱。
     let sendResolve;
     let sendReject;
     const sendResult = new Promise((resolve, reject) => {
       sendResolve = resolve;
       sendReject = reject;
     });
-    sendChain = sendChain.then(async () => {
+    setSendChainFor(id, sendChainFor(id).then(async () => {
       try {
         // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
         await sleep(randInt(800, 2000));
         assertSendAllowed();
+        if (onTelegram) {
+          const sent = await telegramSendImage(id, image.buffer, {
+            replyTo: segments[0]?.type === 'reply' ? Number(segments[0].data.id) : null,
+            atUserId,
+            label: `[表情包:${entry.desc || entry.localNote || entry.id}]`
+          });
+          sendResolve({ message_id: sent?.message_id ?? null });
+          return;
+        }
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -1997,7 +2010,7 @@ async function main() {
       } catch (error) {
         sendReject(error);
       }
-    });
+    }));
     const data = await sendResult;
     // 更新本地使用统计
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
@@ -2451,8 +2464,8 @@ async function main() {
     return k.startsWith('private:') && isOwnerUserId(k.slice('private:'.length));
   }
 
-  /** 往 Telegram 会话发一条文字；成功后把它记进引用缓存（别人引用她的话时才认得出来）。 */
-  async function telegramSend(convId, message, { replyTo = null, atUserId = null } = {}) {
+  /** Telegram 发送的公共部分：会话 → chat_id，@ 谁 → text_mention，群里落到最近的话题。 */
+  function telegramTarget(convId, atUserId) {
     if (!tg.client || !tg.me) throw new Error('Telegram 未连接');
     const chatId = tgChatIdOf(convId);
     if (chatId === null) throw new Error(`不是 Telegram 会话：${convId}`);
@@ -2464,14 +2477,32 @@ async function main() {
       mention = { userId: uid, name: tg.cache.nameOf(chatId, tgConvId(uid)) || 'TA' };
     }
     const threadId = chatId < 0 ? tg.cache.threadOf(chatId) : null;
+    return { chatId, mention, threadId };
+  }
+
+  /** 把自己发出去的消息记进引用缓存（别人引用她的话时才认得出来）。 */
+  function rememberTelegramSent(chatId, sent, text) {
+    if (sent?.message_id == null) return;
+    tg.cache.remember(chatId, sent.message_id, {
+      userId: tgConvId(tg.me.id),
+      sender: tg.me.first_name || selfDisplayName || '我',
+      text: String(text).slice(0, 200)
+    });
+  }
+
+  /** 往 Telegram 会话发一条文字。 */
+  async function telegramSend(convId, message, { replyTo = null, atUserId = null } = {}) {
+    const { chatId, mention, threadId } = telegramTarget(convId, atUserId);
     const sent = await tg.client.sendText(chatId, message, { replyTo, mention, threadId });
-    if (sent?.message_id != null) {
-      tg.cache.remember(chatId, sent.message_id, {
-        userId: tgConvId(tg.me.id),
-        sender: tg.me.first_name || selfDisplayName || '我',
-        text: String(sent.text ?? message).slice(0, 200)
-      });
-    }
+    rememberTelegramSent(chatId, sent, sent?.text ?? message);
+    return sent;
+  }
+
+  /** 往 Telegram 会话发一张图（表情包工具在 Telegram 上就是发图）。label 是引用缓存里记的文字。 */
+  async function telegramSendImage(convId, buffer, { replyTo = null, atUserId = null, label = '[图片]' } = {}) {
+    const { chatId, mention, threadId } = telegramTarget(convId, atUserId);
+    const sent = await tg.client.sendImage(chatId, buffer, { replyTo, mention, threadId });
+    rememberTelegramSent(chatId, sent, label);
     return sent;
   }
 
@@ -5895,7 +5926,6 @@ async function main() {
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           const keyMatch = parseConvKey(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (keyMatch.telegram) { sendJson({ ok: false, error: TELEGRAM_UNSUPPORTED }, 400); return; }
           const kind = keyMatch.kind;
           const id = keyMatch.id;
           if (!modeAllowed(key, kind, id, cfg, currentMode)) {
@@ -10261,7 +10291,7 @@ async function main() {
     const id = tg.me ? tgConvId(tg.me.id) : '';
     return `【你的身份】这是 Telegram 上的会话（不是 QQ），你在这里叫「${name || '（未取到）'}」${handle ? `（${handle}）` : ''}。`
       + `消息里 @ 你${id ? `（at 段里是 ${id}）` : ''}、或引用你的消息，指的都是你。`
-      + '这里只能发文字：拍一拍、QQ 表情包、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
+      + '这里能发文字和表情包（qq_send_sticker 会以图片发出）；拍一拍、语音、收藏表情、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
   }
 
   function buildWakePromptV2(key, reason) {
@@ -10279,7 +10309,7 @@ async function main() {
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
-    const stickerLine = !isTelegram && stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
+    const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
