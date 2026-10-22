@@ -125,6 +125,7 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 ```
 
 - 收消息用长轮询（getUpdates），不需要公网地址；国内直连不通，`proxy` 填本机 HTTP 代理。
+- 同一个人：`telegram.links: [{ "qq": 123456, "telegram": 789 }]`，这个人在两边的私聊并成一个会话（QQ 私聊为主线，DSH 会话、二代状态、记忆都是一份），她发的话送到 TA 最后说话的平台（`prefer: "qq"` / `"telegram"` 可以固定一边）。收消息和发消息都仍按各自平台的白名单；给模型看的消息开头标 `[QQ]` / `[Telegram]`；跨平台的引用会被去掉；拍一拍、语音只发 QQ。合并前 Telegram 私聊原有的二代状态不再使用。
 - 名单和 QQ 的分开存；名单为空就谁也不理（不跟随 `allowAllWhenEmpty`）。`ownerId` 的私聊总是放行，也能用 `/reset` 等管理命令；封闭 agent 模式（closed-agent）仍只认 QQ 管理员。
 - 不知道 id：先启用并启动桥接，给 bot 发一句话，日志里「忽略未授权会话 private:tg123…」里 `tg` 后面的数字就是。
 - 支持文字和图片：收图给模型看，发文字、引用、@。拍一拍、语音、合并转发只在 QQ 上有，Telegram 会话调用这些工具会直接返回"不支持"。

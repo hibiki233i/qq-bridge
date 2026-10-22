@@ -1407,10 +1407,34 @@ function parseConvKey(key) {
   return { kind: m[1], id, telegram: false };
 }
 
+// 「同一个人」：telegram.links 里配的 QQ 号 ↔ Telegram 用户 id，两个私聊并成一个会话，QQ 那边为主线。
+// Telegram 私聊 key（private:tg…）是 QQ 主会话 key（private:QQ号）的别名；会话、二代状态都记在主会话上。
+// 由 main 在 Telegram 配置有效时设置；Telegram 没启用时为空，一切照旧。
+const linkedPeople = { tgToQq: new Map(), qqToTg: new Map(), prefer: new Map() };
+function setLinkedPeople(links) {
+  linkedPeople.tgToQq.clear();
+  linkedPeople.qqToTg.clear();
+  linkedPeople.prefer.clear();
+  for (const l of Array.isArray(links) ? links : []) {
+    const qqKey = `private:${l.qq}`;
+    const tgKey = `private:tg${l.telegram}`;
+    linkedPeople.tgToQq.set(tgKey, qqKey);
+    linkedPeople.qqToTg.set(qqKey, tgKey);
+    linkedPeople.prefer.set(qqKey, l.prefer || 'last');
+  }
+}
+/** 别名 → 主会话 key；不是别名原样返回。 */
+function linkedPrimaryKey(key) {
+  return linkedPeople.tgToQq.get(key) ?? key;
+}
+
 // 二代会话 key 规范化：只接受 parseConvKey 认得的格式，统一成规范写法，避免同一会话出现多个别名。
+// 「同一个人」的 Telegram 私聊归到 QQ 主会话上。
 function canonicalV2Key(key) {
   const p = parseConvKey(key);
-  return p ? `${p.kind}:${p.id}` : null;
+  if (!p) return null;
+  const k = `${p.kind}:${p.id}`;
+  return linkedPeople.tgToQq.get(k) ?? k;
 }
 
 const APPROVE_WORDS = new Set(['通过', '同意', '允许', '批准', 'yes', 'y', 'approve', 'ok']);
@@ -1749,6 +1773,8 @@ async function main() {
    * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
    */
   async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
+    // 语音只有 QQ 有：「同一个人」的 Telegram 私聊别名发回 QQ 主会话
+    key = linkedPrimaryKey(key);
     if (parseConvKey(key)?.telegram) throw new Error(TELEGRAM_UNSUPPORTED);
     const vc = voiceCfg();
     // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
@@ -2025,6 +2051,12 @@ async function main() {
   }
 
   async function sendStickerV2(key, stickerRef, options = {}) {
+    // 「同一个人」的私聊：发到对方最后说话的平台，引用只保留同平台的
+    const deliveryKey = resolveDeliveryKey(key);
+    if (deliveryKey !== key || linkedPeople.qqToTg.has(key)) {
+      if (!replyUsableOn(key, deliveryKey, options.replyToMessageId)) options = { ...options, replyToMessageId: null };
+      key = deliveryKey;
+    }
     if (parseConvKey(key)?.telegram) return sendStickerTelegramV2(key, stickerRef, options);
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
@@ -2577,6 +2609,9 @@ async function main() {
       log(`⚠️  Telegram 接入未启动：${problems.join('；')}`);
     } else {
       tg.client = new TelegramClient(cfg.telegram);
+      setLinkedPeople(cfg.telegram.links);
+      if (cfg.telegram.invalidLinks?.length) log(`⚠️  telegram.links 里有写错的，已忽略：${cfg.telegram.invalidLinks.join('；')}`);
+      if (cfg.telegram.links.length) log(`同一个人：${cfg.telegram.links.map((l) => `QQ ${l.qq} = Telegram ${l.telegram}`).join('，')}（私聊并成一个会话，QQ 那边为主线）`);
       if (!cfg.telegram.allow.private.length && !cfg.telegram.allow.groups.length && !cfg.telegram.ownerId) {
         log('⚠️  Telegram 白名单为空且没配 telegram.ownerId：bot 会忽略所有消息。被忽略的会话会在日志里打出 id，照着填进 telegram.allow 即可');
       }
@@ -3055,13 +3090,69 @@ async function main() {
   }
 
   /** 当前模式是否允许该会话进入 */
-  function modeAllowed(key, kind, id, cfg, mode) {
+  function modeAllowedRaw(key, kind, id, cfg, mode) {
     if (mode === 'closed-agent') {
       // 封闭 agent 模式：仅 owner 私聊
       return key === `private:${String(cfg.ownerQQ ?? '')}`;
     }
     // chat / reserved / reserved2（仿真模式，暂同 chat 白名单）
     return allowed(kind, id, cfg);
+  }
+
+  /**
+   * 当前模式是否允许该会话。「同一个人」合并后的 QQ 主会话：两个平台任一边放行就算放行
+   * （收消息时 handleIncoming 另按来源平台用 modeAllowedRaw 单独判断，发消息时只发到放行的那边）。
+   */
+  function modeAllowed(key, kind, id, cfg, mode) {
+    if (modeAllowedRaw(key, kind, id, cfg, mode)) return true;
+    const tgKey = linkedPeople.qqToTg.get(key);
+    const p = tgKey ? parseConvKey(tgKey) : null;
+    return !!p && modeAllowedRaw(tgKey, p.kind, p.id, cfg, mode);
+  }
+
+  // 「同一个人」的私聊最后从哪个平台来的：发消息时回到那边（state.linkRoutes 持久化，重启后还记得）
+  const linkedMessageRoutes = new Map(); // `${主会话 key}|${消息 id}` → 来源 key（只用来判断引用能不能跨平台）
+  function noteLinkedRoute(primaryKey, originKey, messageId) {
+    if (!state.linkRoutes || typeof state.linkRoutes !== 'object' || Array.isArray(state.linkRoutes)) state.linkRoutes = {};
+    if (state.linkRoutes[primaryKey] !== originKey) {
+      state.linkRoutes[primaryKey] = originKey;
+      saveState();
+    }
+    if (messageId !== undefined && messageId !== null && String(messageId) !== '') {
+      linkedMessageRoutes.set(`${primaryKey}|${messageId}`, originKey);
+      while (linkedMessageRoutes.size > 2000) linkedMessageRoutes.delete(linkedMessageRoutes.keys().next().value);
+    }
+  }
+
+  /**
+   * 发往这个会话的消息实际该走哪个平台。普通会话原样返回；「同一个人」的私聊：
+   * prefer=qq / telegram 固定一边，last（默认）回到对方最后说话的那边；
+   * 那边在当前模式下不放行、或 Telegram 没连上时，换另一边。
+   */
+  function resolveDeliveryKey(key) {
+    const primary = linkedPrimaryKey(key);
+    const tgKey = linkedPeople.qqToTg.get(primary);
+    if (!tgKey) return key;
+    const prefer = linkedPeople.prefer.get(primary) ?? 'last';
+    const last = state.linkRoutes?.[primary];
+    const order = prefer === 'qq' ? [primary, tgKey]
+      : prefer === 'telegram' ? [tgKey, primary]
+        : (last === tgKey ? [tgKey, primary] : [primary, tgKey]);
+    for (const k of order) {
+      const p = parseConvKey(k);
+      if (!p || !modeAllowedRaw(k, p.kind, p.id, cfg, currentMode)) continue;
+      if (p.telegram && !(tg.client && tg.me)) continue;
+      return k;
+    }
+    return primary;
+  }
+
+  /** 合并会话里引用一条消息：只有确定是从发送目标那个平台来的才引用（两边的消息 id 不通用）。 */
+  function replyUsableOn(key, deliveryKey, replyToMessageId) {
+    const primary = linkedPrimaryKey(key);
+    if (!linkedPeople.qqToTg.has(primary)) return true;
+    if (replyToMessageId === undefined || replyToMessageId === null || String(replyToMessageId).trim() === '') return true;
+    return linkedMessageRoutes.get(`${primary}|${String(replyToMessageId).trim()}`) === deliveryKey;
   }
 
   /**
@@ -7560,7 +7651,8 @@ async function main() {
   function sendToQQ(key, msg) {
     const assertSendAllowed = captureSendGuard(key);
     const safeMsg = redactKnownTokensOnly(msg);
-    const [kind, id] = key.split(':');
+    // 「同一个人」的私聊发到对方最后说话的平台；其它会话原样
+    const [kind, id] = resolveDeliveryKey(key).split(':');
     let chain = sendChainFor(id);
     const parts = splitForQQ(safeMsg);
     lastSendFailed.delete(key);
@@ -7740,7 +7832,7 @@ async function main() {
   // 有概率使用长间隔（错落感）；最后一条后不再 sleep。
   function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
     const assertSendAllowed = captureSendGuard(key);
-    const [kind, id] = key.split(':');
+    const [kind, id] = resolveDeliveryKey(key).split(':');
     let chain = sendChainFor(id);
     let min, max, longProb = 0, longMin = 0, longMax = 0;
     if (typeof socialCfgOrMin === 'object' && socialCfgOrMin !== null) {
@@ -8300,7 +8392,10 @@ async function main() {
 
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
     const assertSendAllowed = captureSendGuard(key);
-    const [kind, id] = key.split(':');
+    const deliveryKey = resolveDeliveryKey(key);
+    const [kind, id] = deliveryKey.split(':');
+    // 合并会话里引用另一个平台的消息没法引用，去掉引用照常发
+    if (!replyUsableOn(key, deliveryKey, replyToMessageId)) replyToMessageId = null;
     let chain = sendChainFor(id);
     const sent = [];
     const failed = [];
@@ -8782,6 +8877,8 @@ async function main() {
         for (const [key, val] of Object.entries(raw.conversations)) {
           if (!val || typeof val !== 'object') continue;
           if (!parseConvKey(key)) continue;
+          // 已经并进 QQ 主会话的 Telegram 私聊：旧状态不再用，免得被当成独立会话唤醒
+          if (linkedPeople.tgToQq.has(key)) { log(`「同一个人」：${key} 已并进 ${linkedPeople.tgToQq.get(key)}，它原来的二代状态不再使用`); continue; }
           const defaultWc = defaultWakeConfigV2();
           let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
           if (!agentToken || seenTokens.has(agentToken)) {
@@ -9996,6 +10093,9 @@ async function main() {
     }
   }
   async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
+    // 「同一个人」合并的私聊：消息从哪个平台来，就去哪个平台查
+    const linkedRoute = linkedMessageRoutes.get(`${kind}:${convId}|${String(messageId)}`);
+    if (linkedRoute && linkedRoute !== `${kind}:${convId}`) convId = parseConvKey(linkedRoute)?.id ?? convId;
     // Telegram 没有按 id 取历史消息的接口，只能查收发时记下的缓存（缓存按会话分开，天然不会跨会话）。
     const tgChat = tgChatIdOf(convId);
     if (tgChat !== null) {
@@ -10540,6 +10640,16 @@ async function main() {
       + '拍一拍、语音、合并转发都是 QQ 才有的，别在这个会话里用。\n\n';
   }
 
+  /** 「同一个人」的私聊：告诉她两边是同一个人，消息会发到哪个平台。 */
+  function linkedPersonLineV2(key) {
+    const primary = linkedPrimaryKey(key);
+    if (!linkedPeople.qqToTg.has(primary)) return '';
+    const platform = (k) => (parseConvKey(k)?.telegram ? 'Telegram' : 'QQ');
+    const last = state.linkRoutes?.[primary];
+    return `【同一个人】TA 在 QQ 和 Telegram 上是同一个人，这是同一段私聊；每条消息开头的 [QQ] / [Telegram] 是 TA 从哪边发来的${last ? `（最近一条来自 ${platform(last)}）` : ''}。`
+      + `你发的消息会送到 ${platform(resolveDeliveryKey(primary))}；拍一拍、语音只能发到 QQ。\n\n`;
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
@@ -10591,7 +10701,7 @@ async function main() {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const base = roleLine + identityLine + linkedPersonLineV2(key) + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -11059,11 +11169,17 @@ async function main() {
 
   // QQ 消息 → DSH prompt
   async function handleIncoming(kind, id, event, cfg) {
-    const key = convKey(kind, id);
-    if (!modeAllowed(key, kind, id, cfg, currentMode)) {
-      log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
+    // 按来源平台自己的白名单判断（「同一个人」合并了会话，但两边的白名单各管各的）
+    const originKey = convKey(kind, id);
+    if (!modeAllowedRaw(originKey, kind, id, cfg, currentMode)) {
+      log(`忽略未授权会话 ${originKey}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
       return;
     }
+    // 「同一个人」：Telegram 私聊并进 QQ 主会话。之后的会话状态都用主会话 key；
+    // 引用解析、媒体下载等跟消息本身有关的仍按来源（id 不变）。
+    const key = linkedPrimaryKey(originKey);
+    const linked = linkedPeople.qqToTg.has(key);
+    if (linked) noteLinkedRoute(key, originKey, event.message_id ?? null);
     const resolveAtName = async (qq) => {
       // 只有群聊才需要把 @QQ号 解析成群名片/昵称；私聊没有群成员概念
       if (kind !== 'group') return null;
@@ -11072,7 +11188,9 @@ async function main() {
     const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
+    // 合并的私聊里标上这句是从哪个平台来的（只加在给模型看的文字上，不影响命令判断）
+    const textContent = (linked ? (originKey === key ? '[QQ] ' : '[Telegram] ') : '')
+      + await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');

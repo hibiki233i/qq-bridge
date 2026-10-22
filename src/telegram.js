@@ -63,6 +63,30 @@ function normalizeTgIdList(value, opts) {
 }
 
 /**
+ * 「同一个人」：QQ 号 ↔ Telegram 用户 id。两个私聊并成一个会话（QQ 那边为主线）。
+ * 写法：[{ qq: 123456, telegram: 789, prefer: 'last' | 'qq' | 'telegram' }]。
+ * 一个号只能出现在一组里；格式不对的、重复的丢掉并记进 invalidLinks（桥接启动时打警告，不影响别的组）。
+ */
+export function normalizeTelegramLinks(raw) {
+  const links = [];
+  const invalid = [];
+  const usedQq = new Set();
+  const usedTg = new Set();
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const qq = Number(String(item?.qq ?? '').trim());
+    const tgId = toTgId(item?.telegram, { allowNegative: false });
+    const prefer = ['qq', 'telegram'].includes(item?.prefer) ? item.prefer : 'last';
+    const label = `${String(item?.qq ?? '?').slice(0, 20)} = ${String(item?.telegram ?? '?').slice(0, 20)}`;
+    if (!Number.isSafeInteger(qq) || qq <= 0 || tgId === null) { invalid.push(`${label}（格式不对）`); continue; }
+    if (usedQq.has(qq) || usedTg.has(tgId)) { invalid.push(`${label}（这个号已经在别的组里）`); continue; }
+    usedQq.add(qq);
+    usedTg.add(tgId);
+    links.push({ qq, telegram: tgId, prefer });
+  }
+  return { links, invalid };
+}
+
+/**
  * config.json 的 `telegram` 段规范化。
  *
  * 白名单与 QQ 的 allow 分开存：Telegram 的群 id 是负数，而 QQ 那套校验只认正整数。
@@ -79,6 +103,7 @@ export function normalizeTelegramConfig(raw) {
     if (ownerId === null) invalidOwnerId = String(ownerRaw).trim().slice(0, 40);
   }
   const pollTimeoutSec = Math.min(50, Math.max(1, Math.floor(Number(t.pollTimeoutSec) || 30)));
+  const { links, invalid: invalidLinks } = normalizeTelegramLinks(t.links);
   return {
     enabled: t.enabled === true,
     botToken: String(t.botToken ?? '').trim(),
@@ -86,6 +111,8 @@ export function normalizeTelegramConfig(raw) {
     apiBase: String(t.apiBase || DEFAULT_API_BASE).trim().replace(/\/+$/, ''),
     ownerId,
     invalidOwnerId,
+    links,
+    invalidLinks,
     allow: {
       private: normalizeTgIdList(t.allow?.private, { allowNegative: false }),
       groups: normalizeTgIdList(t.allow?.groups, { allowNegative: true })

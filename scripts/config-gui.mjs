@@ -76,6 +76,7 @@ export function toForm(file) {
       ownerId: file.telegram?.ownerId == null ? '' : String(file.telegram.ownerId),
       allowPrivate: (file.telegram?.allow?.private ?? []).map(String),
       allowGroups: (file.telegram?.allow?.groups ?? []).map(String),
+      links: (Array.isArray(file.telegram?.links) ? file.telegram.links : []).map((l) => `${l?.qq ?? ''} = ${l?.telegram ?? ''}`),
       stickerFavorites: file.telegram?.stickers?.favorites === true,
       stickerSyncQQ: file.telegram?.stickers?.syncQQ === true
     }
@@ -145,6 +146,20 @@ export function applyForm(file, form) {
   const tgOwnerList = checkTgIds([t.ownerId ?? ''], 'Telegram 管理员', errors, { allowNegative: false });
   const tgAllowPrivate = checkTgIds(t.allowPrivate, 'Telegram 私聊白名单', errors, { allowNegative: false });
   const tgAllowGroups = checkTgIds(t.allowGroups, 'Telegram 群白名单', errors, { allowNegative: true });
+  // 「同一个人」：每行「QQ号 = Telegram id」
+  const prevLinks = Array.isArray(file.telegram?.links) ? file.telegram.links : [];
+  const links = [];
+  for (const raw of Array.isArray(t.links) ? t.links : []) {
+    const line = String(raw).trim();
+    if (!line) continue;
+    const m = /^(\d{5,12})\s*[=＝:：]\s*(\d{1,16})$/.exec(line);
+    if (!m || !Number.isSafeInteger(Number(m[2])) || Number(m[2]) <= 0) { errors.push(`「同一个人」里的「${line}」格式不对，应写成 QQ号 = Telegram id`); continue; }
+    const qq = Number(m[1]);
+    const telegram = Number(m[2]);
+    if (links.some((l) => l.qq === qq || l.telegram === telegram)) { errors.push(`「同一个人」里的「${line}」和前面的重复了`); continue; }
+    const prev = prevLinks.find((l) => Number(l?.qq) === qq && Number(l?.telegram) === telegram);
+    links.push({ qq, telegram, ...(prev?.prefer ? { prefer: prev.prefer } : {}) });
+  }
   if (errors.length) return { errors };
 
   const next = structuredClone(file);
@@ -158,7 +173,7 @@ export function applyForm(file, form) {
   if (form?.allowAllWhenEmpty === true) next.allowAllWhenEmpty = true;
   else if ('allowAllWhenEmpty' in next) next.allowAllWhenEmpty = false;
   // 原来没有 telegram 段、这次也什么都没填，就别凭空加一段
-  const tgTouched = tgEnabled || botToken || proxy || tgOwnerList.length || tgAllowPrivate.length || tgAllowGroups.length;
+  const tgTouched = tgEnabled || botToken || proxy || tgOwnerList.length || tgAllowPrivate.length || tgAllowGroups.length || links.length;
   if ('telegram' in next || tgTouched) {
     const prev = next.telegram ?? {};
     next.telegram = {
@@ -168,6 +183,7 @@ export function applyForm(file, form) {
       proxy,
       ownerId: tgOwnerList[0] ?? null,
       allow: { ...(prev.allow ?? {}), private: tgAllowPrivate, groups: tgAllowGroups },
+      links,
       stickers: { ...(prev.stickers ?? {}), favorites: t.stickerFavorites === true, syncQQ: t.stickerSyncQQ === true }
     };
   }

@@ -13,7 +13,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  normalizeTelegramConfig, telegramConfigProblems, tgChatIdOf, tgConvId, isTelegramConvId,
+  normalizeTelegramConfig, normalizeTelegramLinks, telegramConfigProblems, tgChatIdOf, tgConvId, isTelegramConvId,
   updateToEvent, createTelegramMessageCache, TelegramClient, startTelegramPolling
 } from '../src/telegram.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
@@ -667,7 +667,7 @@ await test('配置页：Telegram 字段读写与校验', () => {
   assert.ok(!r.errors, JSON.stringify(r.errors));
   assert.deepEqual(r.file.telegram, {
     enabled: true, apiBase: 'http://mirror', pollTimeoutSec: 20, botToken: BOT_TOKEN, proxy: 'http://127.0.0.1:7890',
-    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, stickers: { favorites: false, syncQQ: false }
+    ownerId: 111, allow: { private: [222], groups: [-1001234567890] }, links: [], stickers: { favorites: false, syncQQ: false }
   }, '其余 telegram 字段保留，名单去重存数字');
   const off = applyForm({ ...file, telegram: { ...file.telegram, stickers: { defaultEmoji: '😺' } } },
     { ...f, telegram: { ...f.telegram, botToken: BOT_TOKEN, stickerFavorites: false, stickerSyncQQ: false } });
@@ -1017,6 +1017,129 @@ await test('桥接：没配 ownerId 时不建贴纸包，表情照样以图片�
     fakeTelegram(h);
     h.setupTelegramStickers();
     assert.equal(h.tg.stickers, null);
+  } finally { await h.close(); }
+});
+
+// ── 7. 同一个人（QQ 私聊 ↔ Telegram 私聊并成一个会话）────────────────────────
+await test('同一个人：配置规范化（格式、重复、prefer）', () => {
+  const { links, invalid } = normalizeTelegramLinks([
+    { qq: 10001, telegram: 222 },
+    { qq: '10002', telegram: '333', prefer: 'telegram' },
+    { qq: 10003, telegram: 222 },
+    { qq: 10001, telegram: 444 },
+    { qq: 'abc', telegram: 5 },
+    { qq: 10005, telegram: -100 }
+  ]);
+  assert.deepEqual(links, [{ qq: 10001, telegram: 222, prefer: 'last' }, { qq: 10002, telegram: 333, prefer: 'telegram' }]);
+  assert.equal(invalid.length, 4);
+  assert.deepEqual(telegramConfigProblems({ ...normalizeTelegramConfig({ botToken: BOT_TOKEN, links: [{ qq: 'x' }] }) }), [], '写错的组只警告，不让整个 Telegram 停掉');
+});
+
+const LINK_CONFIG = {
+  allow: { private: ['123', '10001'], groups: ['456'] },
+  telegram: { ...TG_CONFIG.telegram, allow: { private: [222], groups: [-100500] }, links: [{ qq: 10001, telegram: 222 }] }
+};
+const qqEvent = (text, messageId) => ({ post_type: 'message', message_type: 'private', user_id: 10001, self_id: 999, message_id: messageId, sender: { user_id: 10001, nickname: '小明' }, message: [{ type: 'text', data: { text } }] });
+const tgEventFor = (h, text, messageId) => updateToEvent(msgUpdate({ chat: { id: 222, type: 'private' }, from: { id: 222, first_name: 'Alice' }, text, message_id: messageId }), h.tg.me, { cache: h.tg.cache, now: NOW * 1000 });
+
+await test('同一个人：Telegram 私聊并进 QQ 主会话，回复发到 TA 最后说话的平台', async () => {
+  const h = await bridgeHarness({ config: LINK_CONFIG, files: { 'state/social-v2.json': { conversations: { 'private:tg222': { agentToken: 'b'.repeat(32) } } } } });
+  try {
+    const calls = fakeTelegram(h);
+    h.setMode('reserved2');
+    assert.ok(!h.socialV2.conversations.has('private:tg222'), '并进来的 Telegram 私聊原来的二代状态不再使用');
+    const r = tgEventFor(h, '在吗', 41);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    const st = h.getSocialV2State('private:10001');
+    assert.ok(st.unread.some((m) => m.text === '[Telegram] 在吗'), JSON.stringify(st.unread.map((m) => m.text)));
+    assert.equal(h.getSocialV2State('private:tg222'), st, '别名拿到的是同一份状态');
+    assert.equal(h.resolveDeliveryKey('private:10001'), 'private:tg222');
+    assert.match(h.buildWakePromptV2('private:10001', 'private'), /【同一个人】.*最近一条来自 Telegram.*送到 Telegram/);
+    await withServer(h, async (port) => {
+      // 她用主会话 key 发：送到 Telegram
+      const a = await consoleCall(port, '/api/socialV2/send-message', { method: 'POST', token: st.agentToken, body: { key: 'private:10001', messages: ['在呀'] } });
+      assert.equal(a.status, 200, a.body);
+      assert.deepEqual(calls.filter((c) => c.text).map((c) => [c.chatId, c.text]), [[222, '在呀']]);
+      // 用 Telegram 别名 key + 同一个令牌也行
+      const b = await consoleCall(port, '/api/socialV2/send-message', { method: 'POST', token: st.agentToken, body: { key: 'private:tg222', messages: ['嗯'] } });
+      assert.equal(b.status, 200, b.body);
+      // TA 换到 QQ 说话 → 回复发 QQ；引用 Telegram 那条消息时去掉引用
+      await h.handleIncoming('private', 10001, qqEvent('我在 QQ', 9001), h.cfg);
+      assert.ok(st.unread.some((m) => m.text === '[QQ] 我在 QQ'));
+      h.calls.http.length = 0;
+      const c = await consoleCall(port, '/api/send/private', { method: 'POST', token: st.agentToken, body: { userId: '10001', message: '看到了', replyToMessageId: 41, token: st.agentToken } });
+      assert.equal(c.status, 200, c.body);
+      const qqSend = h.calls.http.find((x) => x.url.endsWith('/send_private_msg'));
+      assert.equal(qqSend.body.user_id, 10001, '发到 QQ');
+      assert.ok(!qqSend.body.message.some((seg) => seg.type === 'reply'), '跨平台的引用去掉');
+      h.calls.http.length = 0;
+      // 脚手架里的假 QQ 网关不支持按 id 查消息，用 seq 引用（桥接会映射回真实的 9001）
+      const qqSeq = st.recentMessages.find((m) => m.messageId === '9001').seq;
+      const d = await consoleCall(port, '/api/send/private', { method: 'POST', token: st.agentToken, body: { userId: '10001', message: '回你', replyToMessageId: qqSeq, token: st.agentToken } });
+      assert.equal(d.status, 200, d.body);
+      assert.ok(h.calls.http.find((x) => x.url.endsWith('/send_private_msg')).body.message.some((seg) => seg.type === 'reply'), '同平台的引用保留');
+    });
+    assert.equal(calls.filter((c) => c.text).length, 2, '换到 QQ 后不再发 Telegram');
+  } finally { await h.close(); }
+});
+
+await test('同一个人：两边白名单各管各的；Telegram 没连上或指定了平台时按规则选', async () => {
+  const h = await bridgeHarness({ config: LINK_CONFIG });
+  try {
+    const calls = fakeTelegram(h);
+    h.setMode('chat');
+    // 一代模式也并会话：DSH 会话建在主会话上
+    const r = tgEventFor(h, '你好', 42);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    assert.ok(h.state.sessions['private:10001'], 'DSH 会话记在主会话上');
+    assert.ok(!h.state.sessions['private:tg222']);
+    assert.match(JSON.stringify(h.calls.prompts.at(-1).content), /\[Telegram\] 你好/);
+    assert.equal(h.state.linkRoutes['private:10001'], 'private:tg222', '记下最后从哪边来（会持久化）');
+    // Telegram 没连上：发 QQ
+    const me = h.tg.me;
+    h.tg.me = null;
+    assert.equal(h.resolveDeliveryKey('private:10001'), 'private:10001');
+    h.tg.me = me;
+    // Telegram 那边不在白名单：Telegram 来的消息不收，发也只发 QQ
+    h.cfg.telegram.allow.private = [];
+    const before = h.calls.prompts.length;
+    await h.handleIncoming(r.kind, r.id, tgEventFor(h, '再来', 43).event, h.cfg);
+    assert.equal(h.calls.prompts.length, before, 'Telegram 不放行就不收');
+    assert.equal(h.resolveDeliveryKey('private:10001'), 'private:10001', '也不往 Telegram 发');
+    // QQ 那边不在白名单、Telegram 在：QQ 来的不收，会话照样可用，发到 Telegram
+    h.cfg.telegram.allow.private = [222];
+    h.cfg.allow.private = ['123'];
+    await h.handleIncoming('private', 10001, qqEvent('qq 来的', 9002), h.cfg);
+    assert.equal(h.calls.prompts.length, before, 'QQ 不放行就不收');
+    assert.equal(h.isSessionAllowedInCurrentMode('private:10001'), true, '有一边放行，会话就还在');
+    assert.equal(h.resolveDeliveryKey('private:10001'), 'private:tg222');
+    await h.sendToQQ('private:10001', '只能发 Telegram');
+    assert.equal(calls.filter((c) => c.text).at(-1).text, '只能发 Telegram');
+    // 没合并的会话不受影响
+    assert.equal(h.resolveDeliveryKey('private:123'), 'private:123');
+    assert.equal(h.resolveDeliveryKey('group:456'), 'group:456');
+  } finally { await h.close(); }
+});
+
+await test('同一个人：配置页按行读写，保留 prefer，格式错和重复都拦下', () => {
+  const file = { ownerQQ: 10001, allow: {}, telegram: { botToken: BOT_TOKEN, links: [{ qq: 10001, telegram: 222, prefer: 'telegram' }] } };
+  const f = toForm(file);
+  assert.deepEqual(f.telegram.links, ['10001 = 222']);
+  const ok = applyForm(file, { ...f, telegram: { ...f.telegram, links: ['10001 = 222', '10002：333', ''] } });
+  assert.ok(!ok.errors, JSON.stringify(ok.errors));
+  assert.deepEqual(ok.file.telegram.links, [{ qq: 10001, telegram: 222, prefer: 'telegram' }, { qq: 10002, telegram: 333 }]);
+  const bad = applyForm(file, { ...f, telegram: { ...f.telegram, links: ['abc', '10001 = 222', '10001 = 444', '10003 = -5'] } });
+  assert.equal(bad.errors.length, 3, JSON.stringify(bad.errors));
+});
+
+await test('同一个人：prefer 指定平台', async () => {
+  const h = await bridgeHarness({ config: { ...LINK_CONFIG, telegram: { ...LINK_CONFIG.telegram, links: [{ qq: 10001, telegram: 222, prefer: 'qq' }] } } });
+  try {
+    fakeTelegram(h);
+    h.setMode('chat');
+    const r = tgEventFor(h, '你好', 44);
+    await h.handleIncoming(r.kind, r.id, r.event, h.cfg);
+    assert.equal(h.resolveDeliveryKey('private:10001'), 'private:10001', 'prefer=qq 时 TA 在 Telegram 说话也回 QQ');
   } finally { await h.close(); }
 });
 

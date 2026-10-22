@@ -206,6 +206,11 @@ code { background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:
         <div class="field-note">群 id 是负数，一般 -100 开头</div>
       </div>
       <div class="full">
+        <label for="tgLinks">同一个人（可选）</label>
+        <textarea id="tgLinks" placeholder="123456789 = 987654321"></textarea>
+        <div class="field-note">每行一对「QQ号 = Telegram id」：这个人在两边的私聊会并成一段，她不管在哪边都接着聊，回复发到 TA 最后说话的那边。白名单还是两边各管各的。</div>
+      </div>
+      <div class="full">
         <label class="check"><input type="checkbox" id="tgStickerFav">
           <span>让她收藏 Telegram 贴纸（存进她自己的贴纸包，挂在上面的管理员名下）</span></label>
         <label class="check"><input type="checkbox" id="tgStickerSync">
@@ -266,6 +271,7 @@ function readForm() {
       ownerId: $('tgOwner').value.trim(),
       allowPrivate: splitIds($('tgAllowPrivate').value),
       allowGroups: splitIds($('tgAllowGroups').value),
+      links: $('tgLinks').value.split('\n').map((x) => x.trim()).filter(Boolean),
       stickerFavorites: $('tgStickerFav').checked,
       stickerSyncQQ: $('tgStickerSync').checked
     }
@@ -290,6 +296,7 @@ function fillForm(f) {
   $('tgOwner').value = f.telegram.ownerId;
   $('tgAllowPrivate').value = f.telegram.allowPrivate.join(', ');
   $('tgAllowGroups').value = f.telegram.allowGroups.join(', ');
+  $('tgLinks').value = f.telegram.links.join('\n');
   $('tgStickerFav').checked = f.telegram.stickerFavorites;
   $('tgStickerSync').checked = f.telegram.stickerSyncQQ;
 }
