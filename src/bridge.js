@@ -3364,6 +3364,22 @@ async function main() {
     return dshDefaultPreset || '';
   }
 
+  // 二代仿真下管理员私聊专用的 preset（qq-chat-v2 + 操作安卓模拟器），由 setup-dsh.mjs 按
+  // socialV2.ownerPhone 写进 DSH。只给 private:<ownerQQ>（「同一个人」的 Telegram 私聊也归到这里），群聊永远不用。
+  const OWNER_PHONE_PRESET = 'qq-chat-v2-owner';
+  let ownerPresetMissingLogged = false;
+  function ownerPhonePreset(key, cfg) {
+    if (cfg.socialV2?.ownerPhone?.enabled !== true || !cfg.ownerQQ) return '';
+    if ((canonicalV2Key(key) ?? key) !== `private:${cfg.ownerQQ}`) return '';
+    if (dshPresetIds.includes(OWNER_PHONE_PRESET)) { ownerPresetMissingLogged = false; return OWNER_PHONE_PRESET; }
+    // DSH 里没有（没跑 setup-dsh 或没重启 DSH）：照旧用二代 preset，绝不往权限更高的方向回退
+    if (dshPresetIds.length && !ownerPresetMissingLogged) {
+      ownerPresetMissingLogged = true;
+      log(`⚠️ socialV2.ownerPhone 开着，但 DSH 里没有 preset "${OWNER_PHONE_PRESET}"，管理员私聊先用二代 preset（没有手机工具）；请运行 node scripts/setup-dsh.mjs 并重启 DSH`);
+    }
+    return '';
+  }
+
   /** 当前模式下的会话预设；返回 undefined 表示「该模式下没有可安全使用的 preset」 */
   function modePreset(key, mode, cfg) {
     if (mode === 'closed-agent') {
@@ -3373,6 +3389,10 @@ async function main() {
     }
     // 二代仿真模式优先使用 socialV2.agentPreset；未配置时回退到默认聊天预设。
     // 非 closed-agent 一律 strict：宁可建不出会话，也不给群聊套上带本地工具的默认 preset。
+    if (mode === 'reserved2') {
+      const owner = ownerPhonePreset(key, cfg);
+      if (owner) return owner;
+    }
     const wanted = mode === 'reserved2' ? (cfg.socialV2?.agentPreset || cfg.agentPreset) : cfg.agentPreset;
     return resolvePresetName(wanted, { strict: true }) || undefined;
   }

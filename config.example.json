@@ -126,6 +126,7 @@
     "enabled": true,
     "autoReplyCheckMs": 30000,
     "agentPreset": "qq-chat-v2",
+    "ownerPhone": { "enabled": false, "serial": "emulator-5554" },
     "provideRecommendations": true,
     "tools": {
       "getPrompt": true,

@@ -50,10 +50,18 @@ fs.writeFileSync(path.join(tmpHome, 'profiles', 'web', 'package.json'), JSON.str
 // 这样脚本会走「已存在且指向本仓库 → 跳过」的正常分支。
 fs.symlinkSync(path.join(ROOT, 'plugins', 'qq-mode-console'), path.join(tmpHome, 'plugins', 'qq-mode-console'), 'junction');
 
-function runSetup(label) {
+// config.json 用临时文件（不读仓库里用户真实的那份）：先开 socialV2.ownerPhone 跑两次，再关掉跑一次
+const fakePhoneMcp = path.join(tmpHome, 'phone-mcp.js');
+fs.writeFileSync(fakePhoneMcp, '// stub\n', 'utf8');
+const configOn = path.join(tmpHome, 'config-on.json');
+fs.writeFileSync(configOn, JSON.stringify({ socialV2: { ownerPhone: { enabled: true, serial: 'emulator-5554', mcpScript: fakePhoneMcp } } }), 'utf8');
+const configOff = path.join(tmpHome, 'config-off.json');
+fs.writeFileSync(configOff, JSON.stringify({ socialV2: {} }), 'utf8');
+
+function runSetup(label, configFile = configOn) {
   const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'setup-dsh.mjs'), 'web'], {
     // 保留最小 PATH（进程启动需要），但把 dsh CLI 排除在外 → 跳过自动 pnpm 安装那一步
-    env: { ...process.env, DSH_HOME: tmpHome, PATH: path.dirname(process.execPath) },
+    env: { ...process.env, DSH_HOME: tmpHome, PATH: path.dirname(process.execPath), QQ_BRIDGE_CONFIG: configFile },
     encoding: 'utf8',
     cwd: ROOT,
   });
@@ -122,6 +130,29 @@ for (const p of ['qq-chat', 'qq-chat-v2']) {
   console.log(`${ok ? '✅' : '❌'} preset ${p} 的 patch 层就绪（含 @deepseek-ai/dsh-agent-preset 行 + config.id）`);
   if (!ok) failed += 1;
 }
+// 断言 7：管理员私聊 preset —— 开着时恰好一份，手机 MCP 只在它自己的行列表里，守卫逐个放行
+const ownerRows = (doc ?? []).filter((e) => e?.insert).flatMap((e) => e.insert).filter((x) => x?.id === 'preset-qq-chat-v2-owner');
+const owner = ownerRows[0]?.config;
+const phoneRow = owner?.plugins?.find((x) => x.id === 'mcp-phone');
+const guardRow = owner?.plugins?.find((x) => x.id === 'qq-tool-restrict');
+const ownerChecks = [
+  [ownerRows.length === 1, `管理员 preset 出现 ${ownerRows.length} 次（期望 1）`],
+  [owner?.id === 'qq-chat-v2-owner', 'preset id 是 qq-chat-v2-owner'],
+  [phoneRow?.config?.command === process.execPath && phoneRow?.config?.args?.[0] === fakePhoneMcp, 'mcp-phone 用本机 node 跑配置里的 phone-mcp'],
+  [phoneRow?.config?.env?.PHONE_SERIAL === 'emulator-5554', 'PHONE_SERIAL=emulator-5554'],
+  [Array.isArray(guardRow?.config?.allowTools) && guardRow.config.allowTools.includes('mcp__phone__phone_tap')
+    && !guardRow.config.allowTools.some((t) => /phone_connect|phone_pair|video_frames|qzone|ncm_/.test(t)), '守卫只放行操作模拟器的工具'],
+  [/【管理员私聊专属/.test(owner?.plugins?.find((x) => x.id === 'persona')?.config?.suffix ?? '') && !/\{\{/.test(owner?.plugins?.find((x) => x.id === 'persona')?.config?.suffix ?? ''), 'persona 带手机说明，且没有 {{变量}}'],
+  [!ids0().includes('mcp-phone'), '手机 MCP 没挂在全局层（群聊会话看不到）'],
+];
+function ids0() { return (doc ?? []).filter((e) => e?.insert).flatMap((e) => e.insert.map((x) => x.id)); }
+for (const [ok, label] of ownerChecks) { console.log(`${ok ? '✅' : '❌'} ${label}`); if (!ok) failed += 1; }
+runSetup('关掉 ownerPhone 再跑一次', configOff);
+const offPatch = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+const offOk = !offPatch.includes('preset-qq-chat-v2-owner') && offPatch.includes('id: mcp-snowluma\n');
+console.log(`${offOk ? '✅' : '❌'} 关掉后管理员 preset 被删掉，其它托管条目还在`);
+if (!offOk) failed += 1;
+
 const legacyDir = path.join(tmpHome, '.agent-presets');
 console.log(`${legacyDir && !fs.existsSync(legacyDir) ? '✅' : '❌'} 未创建 0.1.7 已废弃的 ~/.dsh/.agent-presets`);
 if (fs.existsSync(legacyDir)) failed += 1;

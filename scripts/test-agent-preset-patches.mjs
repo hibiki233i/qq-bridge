@@ -14,6 +14,7 @@ import yaml from 'js-yaml';
 import {
   BUNDLE_DIR, GUARD_SPECIFIER, PRESETS, REPO_ROOT,
   buildPatches, patchFileFor, presetRowId,
+  OWNER_PRESET, DEFAULT_OWNER_PHONE_TOOLS, renderOwnerPresetRow,
 } from './build-agent-preset-patches.mjs';
 
 let failures = 0;
@@ -117,6 +118,33 @@ console.log('## 4. bundle 声明与安全边界');
     if (typeof guardFn({ name }) !== 'string') deniedAll = false;
   }
   ok(deniedAll, '非法/未知/空工具名一律拒绝（fail-closed）');
+}
+
+console.log('## 管理员私聊 preset（qq-chat-v2-owner）');
+{
+  const opts = { nodePath: process.execPath, phoneScript: path.resolve('/x/phone-mcp.js'), serial: 'emulator-5554' };
+  const row = renderOwnerPresetRow(opts);
+  const base = load(patchFileFor('qq-chat-v2'))[0].insert[0];
+  ok(row.id === presetRowId(OWNER_PRESET) && row.config.id === OWNER_PRESET, '行 id / preset id 正确');
+  const strip = (plugins) => plugins.filter((r) => r.id !== 'mcp-phone').map((r) => {
+    if (r.id === 'persona') { const { suffix, ...rest } = r.config; return { ...r, config: rest }; }
+    if (r.id === 'qq-tool-restrict') { const { allowTools, ...rest } = r.config; return { ...r, config: rest }; }
+    return r;
+  });
+  ok(JSON.stringify(strip(row.config.plugins)) === JSON.stringify(base.config.plugins), '除了 suffix / allowTools / mcp-phone，行列表和 qq-chat-v2 一模一样（人设跟着二代走）');
+  const guardRow = row.config.plugins.find((r) => r.id === 'qq-tool-restrict');
+  ok(JSON.stringify(guardRow.config.allowTools) === JSON.stringify(DEFAULT_OWNER_PHONE_TOOLS.map((t) => `mcp__phone__${t}`)), '守卫放行的正好是默认的手机工具');
+  ok(!DEFAULT_OWNER_PHONE_TOOLS.some((t) => /^(phone_pair|phone_connect|video_frames)$|^qzone_|^ncm_|^music_/.test(t)), '默认不放行换设备、读本机文件 / 抓网址、发说说、网易云');
+  const phone = row.config.plugins.find((r) => r.id === 'mcp-phone');
+  ok(phone?.name === '@deepseek-ai/dsh-mcp-client' && phone.config.serverName === 'phone' && phone.config.env.PHONE_SERIAL === 'emulator-5554', 'mcp-phone 行挂在 preset 自己的行列表里');
+  ok(!/\{\{/.test(row.config.plugins.find((r) => r.id === 'persona').config.suffix), 'suffix 里没有 {{变量}}');
+  const throws = (patch) => { try { renderOwnerPresetRow({ ...opts, ...patch }); return false; } catch { return true; } };
+  ok(throws({ serial: 'a b' }) && throws({ serial: '' }) && throws({ serial: 'x;rm' }), '设备号不合法就报错');
+  ok(throws({ nodePath: 'node' }) && throws({ phoneScript: 'phone-mcp.js' }), '路径必须是绝对路径');
+  ok(throws({ tools: [] }) && throws({ tools: ['mcp__phone__phone_tap'] }) && throws({ tools: ['Phone Tap'] }), '工具名列表不合法就报错');
+  ok(renderOwnerPresetRow({ ...opts, tools: ['phone_tap'] }).config.plugins.find((r) => r.id === 'qq-tool-restrict').config.allowTools.join() === 'mcp__phone__phone_tap', '可以收窄工具列表');
+  const bundlePkg = JSON.parse(read(path.join(BUNDLE_DIR, 'package.json')));
+  ok(!PRESETS.includes(OWNER_PRESET) && !JSON.stringify(bundlePkg).includes(OWNER_PRESET), '管理员 preset 不进 bundle（它带本机路径）');
 }
 
 console.log(failures === 0 ? '\n✅ agent preset patch 契约通过' : `\n❌ ${failures} 项失败`);

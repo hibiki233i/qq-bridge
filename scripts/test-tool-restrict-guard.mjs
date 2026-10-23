@@ -115,6 +115,23 @@ await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝
   assert.match(String(guard({})), /工具名无效/);
 });
 
+await test('allowTools：只有配了的 preset 才放行，而且只认逐个写出的全名', async () => {
+  const mod = await loadPlugin(path.join(tmpDir, 'diag-allow.log'));
+  // 没配（qq-chat / qq-chat-v2）：手机工具一律拒绝
+  const plain = makeCtx({ restrictImpl: () => undefined });
+  mod.apply(plain.ctx);
+  assert.match(String(plain.calls.guard({ name: 'mcp__phone__phone_tap' })), /不在 QQ 桥接白名单内/);
+  // 管理员 preset：逐个放行；没写出的同服务器工具、前缀、坏名字都不算
+  const owner = makeCtx({ restrictImpl: () => undefined });
+  mod.apply(owner.ctx, { allowTools: ['mcp__phone__phone_tap', 'mcp__phone__phone_screenshot', 'mcp__phone__', 'pwsh', 'mcp__phone__x;y', 42] });
+  assert.equal(owner.calls.guard({ name: 'mcp__phone__phone_tap' }), undefined);
+  assert.equal(owner.calls.guard({ name: 'mcp__phone__phone_screenshot' }), undefined);
+  for (const name of ['mcp__phone__phone_connect', 'mcp__phone__video_frames', 'mcp__phone__qzone_post', 'pwsh', 'mcp__phone__']) {
+    assert.match(String(owner.calls.guard({ name })), /不在 QQ 桥接白名单内/, `${name} 必须拒绝`);
+  }
+  assert.deepEqual([...mod.extraAllowedTools({ allowTools: ['mcp__phone__', 'pwsh', 'mcp__phone__phone_tap'] })], ['mcp__phone__phone_tap']);
+});
+
 fs.rmSync(tmpDir, { recursive: true, force: true });
 console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  tests=${tests} failures=${failures}`);
 if (failures) process.exit(1);

@@ -8,6 +8,8 @@
 //   2. 在 DSH profile 的 cordis.patch.yml 中挂载三个 MCP server：
 //      mcp-snowluma / mcp-snowluma-host / mcp-web-search-safe
 //   3. 在 profile package.json 中注册两个 bundle：qq-mode-console、qq-agent-presets
+//   4. config.json 里开了 socialV2.ownerPhone 时，再写一个管理员私聊专用的 preset
+//      qq-chat-v2-owner（qq-chat-v2 + 操作安卓模拟器的 phone-mcp）
 //
 // 用法：
 //   node scripts/setup-dsh.mjs [profile]
@@ -19,7 +21,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { BUNDLE_DIR, PRESETS, buildPatches, patchFileFor } from './build-agent-preset-patches.mjs';
+import { BUNDLE_DIR, PRESETS, OWNER_PRESET, buildPatches, patchFileFor, presetRowId, renderOwnerPresetRow } from './build-agent-preset-patches.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -124,6 +126,28 @@ function yamlSingleQuote(s) {
 
 // 由桥接托管的 MCP 条目 id：脚本对这三个 id 拥有所有权，可安全地按 id 增删。
 const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
+// 管理员私聊 preset 的行 id：同样归脚本所有，每次先删再按 config.json 决定写不写。
+const MANAGED_IDS = [...MANAGED_MCP_IDS, presetRowId(OWNER_PRESET)];
+
+const CONFIG_FILE = process.env.QQ_BRIDGE_CONFIG || path.join(REPO_ROOT, 'config.json');
+const DEFAULT_PHONE_MCP = path.resolve(REPO_ROOT, '..', 'ai-companion-kit', 'packages', 'phone-mcp', 'src', 'phone-mcp.js');
+
+/** config.json 的 socialV2.ownerPhone：没开返回 null；开了但不能用就报错退出（不留半截配置）。 */
+function ownerPhoneOptions() {
+  let config;
+  try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8').replace(/^\uFEFF/, '')); }
+  catch { return null; }
+  const op = config?.socialV2?.ownerPhone;
+  if (!op || op.enabled !== true) return null;
+  const phoneScript = path.resolve(String(op.mcpScript || DEFAULT_PHONE_MCP));
+  if (!fs.existsSync(phoneScript)) fatal(`socialV2.ownerPhone 已开启，但找不到 phone-mcp：${phoneScript}（装好 ai-companion-kit，或在 ownerPhone.mcpScript 填它的路径）`);
+  return {
+    nodePath: process.execPath,
+    phoneScript,
+    serial: String(op.serial || 'emulator-5554'),
+    ...(Array.isArray(op.tools) ? { tools: op.tools } : {}),
+  };
+}
 
 function mcpEntries() {
   const node = process.execPath;
@@ -146,6 +170,13 @@ function mcpEntries() {
     out += `          - ${yamlSingleQuote(s.script)}\n`;
     // qq_wait_for_messages 最长可等 10 分钟；DSH 默认 60s 会提前掐断工具调用。
     if (s.toolCallTimeoutMs) out += `        toolCallTimeoutMs: ${s.toolCallTimeoutMs}\n`;
+  }
+  const phone = ownerPhoneOptions();
+  if (phone) {
+    let row;
+    try { row = renderOwnerPresetRow(phone); } catch (error) { fatal(error.message); }
+    out += `# 管理员私聊 preset（config.json 的 socialV2.ownerPhone 开着；设备 ${phone.serial}）\n`;
+    out += yaml.dump([{ insert: [row] }], { lineWidth: -1, noRefs: true });
   }
   out += '# === qq-bridge MCP END ===\n';
   return out;
@@ -176,18 +207,19 @@ function prepareCordisPatch() {
     if (!Object.hasOwn(operation, 'insert')) { kept.push(operation); continue; }
     if (!Array.isArray(operation.insert)) fatal(`insert must be an array in ${patchFile}; file unchanged`);
     const entries = operation.insert.filter((entry) => {
-      if (!MANAGED_MCP_IDS.includes(entry?.id)) return true;
+      if (!MANAGED_IDS.includes(entry?.id)) return true;
       removed++;
       return false;
     });
     // Retain shared insert parents and their selectors/other operation fields.
     if (entries.length || Object.keys(operation).length > 1) kept.push({ ...operation, insert: entries });
   }
-  const text = (kept.length ? `${yaml.dump(kept, { lineWidth: -1, noRefs: true })}\n` : '') + mcpEntries();
-  return { patchFile, original, text, removed };
+  const managed = mcpEntries();
+  const text = (kept.length ? `${yaml.dump(kept, { lineWidth: -1, noRefs: true })}\n` : '') + managed;
+  return { patchFile, original, text, removed, ownerPreset: managed.includes(`id: ${presetRowId(OWNER_PRESET)}`) };
 }
 
-function patchCordis({ patchFile, original, text, removed }) {
+function patchCordis({ patchFile, original, text, removed, ownerPreset }) {
   ensureDir(path.dirname(patchFile));
   // Parsing/serialization normalizes formatting; keep the original text (including comments).
   if (original && original !== text) {
@@ -201,6 +233,9 @@ function patchCordis({ patchFile, original, text, removed }) {
     fs.rmSync(temporary, { force: true });
   }
   log(`cordis.patch.yml: MCP 条目已同步（清理旧条目 ${removed} 条，写入 ${MANAGED_MCP_IDS.length} 条）`);
+  log(ownerPreset
+    ? `管理员私聊 preset ${OWNER_PRESET} 已写入（socialV2.ownerPhone 开着）`
+    : `未写管理员私聊 preset（config.json 的 socialV2.ownerPhone 没开）`);
 }
 
 /**

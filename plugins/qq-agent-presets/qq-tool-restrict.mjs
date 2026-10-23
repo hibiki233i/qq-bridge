@@ -225,6 +225,16 @@ const SAFE_EXACT = new Set([
   'todo_write',
 ])
 
+// preset 额外放行的工具（只有 qq-chat-v2-owner 这种管理员私聊专用 preset 才会配）：
+// 只认逐个写出的 MCP 工具全名，不认前缀，免得 phone-mcp 以后加的工具（发说说、抓网页等）
+// 不声不响就被放行。名字不合格的直接丢掉。
+const ALLOWED_TOOL_NAME_RE = /^mcp__[A-Za-z0-9_-]{1,32}__[A-Za-z0-9_]{1,64}$/
+
+export function extraAllowedTools(config) {
+  const list = Array.isArray(config?.allowTools) ? config.allowTools : []
+  return new Set(list.filter((name) => typeof name === 'string' && ALLOWED_TOOL_NAME_RE.test(name)))
+}
+
 // ── 诊断落盘：restrict 失败时到底为什么 ────────────────────────────────────
 //
 // 为什么必须落盘（2026-10-18 实测）：重启之后新建的 QQ 会话 schema 里，
@@ -261,7 +271,8 @@ function writeDiagnostics(lines) {
   } catch {}
 }
 
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  const extraAllowed = extraAllowedTools(config)
   // 1) 把已知危险全局工具从 schema 隐藏（restrict 只影响继承的全局层，
   //    不会误删 preset 自己注册的 scoped 工具）。
   // 逐个 restrict：当前 DSH 版本不存在的工具名会单独抛错并跳过，
@@ -322,6 +333,7 @@ export function apply(ctx) {
     const name = exec?.name
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
     if (SAFE_EXACT.has(name)) return
+    if (extraAllowed.has(name)) return
     if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
     return `工具 "${name}" 不在 QQ 桥接白名单内，已拒绝（仅允许 QQ MCP 工具与无害模型侧工具）`
   })

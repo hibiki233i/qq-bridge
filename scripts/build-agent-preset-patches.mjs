@@ -109,8 +109,8 @@ function normalizeRows(rows, preset) {
   return normalized;
 }
 
-/** 渲染一个 preset 的 patch 文件内容。 */
-export function renderPatch(name) {
+/** 一个 preset 的 @deepseek-ai/dsh-agent-preset 行（已校验、已改写相对行名）。 */
+function presetRow(name) {
   const dir = sourceDirFor(name);
   const meta = readYaml(path.join(dir, 'preset.yml'));
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) throw new Error(`${name}: preset.yml 必须是映射`);
@@ -118,7 +118,7 @@ export function renderPatch(name) {
     if (meta[field] === undefined) throw new Error(`${name}: preset.yml 缺少 ${field}`);
   }
   const plugins = normalizeRows(readYaml(path.join(dir, 'agent.cordis.yml')), name);
-  const row = {
+  return {
     id: presetRowId(name),
     name: '@deepseek-ai/dsh-agent-preset',
     config: {
@@ -129,6 +129,11 @@ export function renderPatch(name) {
       plugins,
     },
   };
+}
+
+/** 渲染一个 preset 的 patch 文件内容。 */
+export function renderPatch(name) {
+  const row = presetRow(name);
   const header = [
     `# 本文件由 scripts/build-agent-preset-patches.mjs 生成，请勿手工编辑。`,
     `# 源：dsh/agent-presets/${name}/preset.yml + agent.cordis.yml（人格正文与工具面都在那里改）。`,
@@ -139,6 +144,75 @@ export function renderPatch(name) {
   ].join('\n');
   // lineWidth: -1 —— 长行不折行，产物与源逐字对应，diff 只反映真实改动。
   return `${header}${yaml.dump([{ insert: [row] }], { lineWidth: -1, noRefs: true })}`;
+}
+
+// ── 管理员私聊专用 preset（qq-chat-v2-owner）────────────────────────────────
+// 不进 bundle：它要写本机的 node / phone-mcp 路径，由 setup-dsh.mjs 写进 profile 的 cordis.patch.yml。
+// 源见 dsh/owner-presets/qq-chat-v2-owner.yml。
+
+export const OWNER_PRESET = 'qq-chat-v2-owner';
+const OWNER_BASE_PRESET = 'qq-chat-v2';
+const OWNER_SOURCE = path.join(REPO_ROOT, 'dsh', 'owner-presets', `${OWNER_PRESET}.yml`);
+
+/**
+ * 默认放行的 phone-mcp 工具：只操作这台模拟器的。
+ * 不放：phone_pair / phone_connect（能让 adb 去连任意地址）、video_frames（读本机文件、让 ffmpeg 抓任意网址）、
+ * qzone_*（用她的号发说说、评论）、ncm_* / music_lyrics（网易云，含聊天室发言）。
+ */
+export const DEFAULT_OWNER_PHONE_TOOLS = Object.freeze([
+  'phone_status', 'phone_devices', 'phone_screenshot', 'phone_dump', 'phone_record_screen',
+  'phone_tap', 'phone_tap_text', 'phone_swipe', 'phone_text', 'phone_key', 'phone_macro', 'phone_open_app',
+]);
+
+const PHONE_SERIAL_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+const PHONE_TOOL_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/; // phone-mcp 自己的工具名，不带 mcp__phone__ 前缀
+
+/**
+ * 管理员私聊 preset 的 @deepseek-ai/dsh-agent-preset 行：qq-chat-v2 的行列表 + 手机。
+ * @param {{ nodePath: string, phoneScript: string, serial: string, tools?: string[] }} opts
+ */
+export function renderOwnerPresetRow({ nodePath, phoneScript, serial, tools = DEFAULT_OWNER_PHONE_TOOLS }) {
+  if (!path.isAbsolute(String(nodePath ?? ''))) throw new Error('ownerPhone：node 路径必须是绝对路径');
+  if (!path.isAbsolute(String(phoneScript ?? ''))) throw new Error('ownerPhone：phone-mcp 路径必须是绝对路径');
+  if (!PHONE_SERIAL_RE.test(String(serial ?? ''))) throw new Error(`ownerPhone.serial 不合法：${JSON.stringify(serial)}（例如 emulator-5554 或 127.0.0.1:5555）`);
+  const toolList = [...new Set(tools)];
+  if (!toolList.length || !toolList.every((t) => typeof t === 'string' && t.length <= 64 && PHONE_TOOL_RE.test(t))) {
+    throw new Error('ownerPhone.tools 必须是非空的 phone-mcp 工具名列表（例如 phone_tap）');
+  }
+  const meta = readYaml(OWNER_SOURCE);
+  for (const field of ['name', 'description', 'order', 'suffix']) {
+    if (meta?.[field] === undefined) throw new Error(`${OWNER_SOURCE} 缺少 ${field}`);
+  }
+  if (/\{\{/.test(meta.suffix)) throw new Error(`${OWNER_SOURCE} 的 suffix 里不能写 {{...}}（DSH 0.2.1 起未知变量会让回合报错）`);
+  const base = presetRow(OWNER_BASE_PRESET);
+  const plugins = base.config.plugins.map((row) => {
+    if (row.id === 'persona') {
+      if (row.config?.suffix) throw new Error(`${OWNER_BASE_PRESET} 的 persona 已有 suffix，管理员 preset 不知道怎么合并`);
+      return { ...row, config: { ...(row.config ?? {}), suffix: meta.suffix } };
+    }
+    if (row.id === 'qq-tool-restrict') {
+      return { ...row, config: { ...(row.config ?? {}), allowTools: toolList.map((t) => `mcp__phone__${t}`) } };
+    }
+    return row;
+  });
+  plugins.push({
+    id: 'mcp-phone',
+    name: '@deepseek-ai/dsh-mcp-client',
+    config: {
+      serverName: 'phone',
+      transport: 'stdio',
+      command: nodePath,
+      args: [phoneScript],
+      env: { PHONE_SERIAL: serial },
+      // 录屏最长 60 秒再抽帧，DSH 默认 60 秒会提前掐断
+      toolCallTimeoutMs: 180000,
+    },
+  });
+  return {
+    id: presetRowId(OWNER_PRESET),
+    name: '@deepseek-ai/dsh-agent-preset',
+    config: { id: OWNER_PRESET, name: meta.name, description: meta.description, order: meta.order, plugins },
+  };
 }
 
 /** 生成（或校验）全部 patch 文件。@returns {{file:string,changed:boolean}[]} */

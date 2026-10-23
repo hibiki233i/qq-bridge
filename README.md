@@ -159,6 +159,7 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 | `snowluma.launcherPath` / `homeDir` | SnowLuma 安装目录（用于 token/端点自发现）。⚠️ 桥接**不会**启动或停止 SnowLuma（见 `LICENSE`） |
 | `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat`（改性格见下文） |
 | `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-v2` |
+| `socialV2.ownerPhone` | 二代仿真下**只给管理员私聊**操作安卓模拟器（默认关）：`{ "enabled": true, "serial": "emulator-5554" }`。开了以后运行 `node scripts/setup-dsh.mjs` 并重启 DSH，`private:<ownerQQ>`（含「同一个人」的 Telegram 私聊）改用 `qq-chat-v2-owner` preset，群聊和别人的私聊不变。`mcpScript` 可指定 phone-mcp 路径（默认 `../ai-companion-kit/packages/phone-mcp/src/phone-mcp.js`），`tools` 可收窄放行的手机工具。详见 RULES.md「管理员私聊的手机工具」 |
 | `socialV2.initialPromptMaxChars` | 会话「初始提示词」（控制台为某个群/私聊预写的环境说明）的字数上限，默认 2000，允许 100~8000。越界值会在启动时收敛并保持原文件不动 |
 | `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛 |
 | `webSearch.provider` | 联网搜索后端：`auto`（默认，优先 DeepSeek、失败回退 Bing）/ `deepseek`（仅 DeepSeek，无凭据时报错）/ `bing` |
