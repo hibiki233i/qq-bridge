@@ -367,16 +367,64 @@ await test('走 HTTP CONNECT 代理', async () => {
   assert.match(err.message, /连不上代理/);
 });
 
-await test('网络错误：握手前断的都重试，握手后断的只重试只读方法', async () => {
-  // telegramHttp 标记错误发生在连上之前还是之后
+const listen = async (server) => { await new Promise((r) => server.listen(0, '127.0.0.1', r)); return server.address().port; };
+
+await test('网络错误：按连没连上标记（http / https / 代理 / 超时 / 超限 / 中途断）', async () => {
   const refused = await telegramHttp('http://127.0.0.1:1/x').catch((e) => e);
   assert.equal(refused.beforeConnect, true, '连接被拒：请求没发出去');
   const hangup = http.createServer((req) => req.socket.destroy());
-  await new Promise((r) => hangup.listen(0, '127.0.0.1', r));
-  const after = await telegramHttp(`http://127.0.0.1:${hangup.address().port}/x`, { method: 'POST', json: {} }).catch((e) => e);
-  hangup.close();
+  const hangupPort = await listen(hangup);
+  const after = await telegramHttp(`http://127.0.0.1:${hangupPort}/x`, { method: 'POST', json: {} }).catch((e) => e);
   assert.equal(after.beforeConnect, false, '连上后才断：请求可能已经到了');
-  // 重试策略（用假的 http，按顺序吐出错误）
+  // https：TCP 连上后不握手直接断（就是代理掐断的样子）
+  const rst = net.createServer((sock) => sock.destroy());
+  const rstPort = await listen(rst);
+  const tlsCut = await telegramHttp(`https://127.0.0.1:${rstPort}/x`).catch((e) => e);
+  assert.match(tlsCut.message, /secure TLS connection|socket hang up|ECONNRESET/);
+  assert.equal(tlsCut.beforeConnect, true, 'https 握手前断');
+  const viaProxy = await telegramHttp(`https://127.0.0.1:${rstPort}/x`, { proxy: PROXY }).catch((e) => e);
+  assert.equal(viaProxy.beforeConnect, true, '走代理时握手前断也算没发出去');
+  const deadProxy = await telegramHttp(`https://127.0.0.1:${rstPort}/x`, { proxy: 'http://127.0.0.1:1' }).catch((e) => e);
+  assert.equal(deadProxy.beforeConnect, true, '代理连不上');
+  // 代理 CONNECT 一直不回：是超时，不标（不重试）
+  const stuck = net.createServer(() => {});
+  const stuckPort = await listen(stuck);
+  const slow = await telegramHttp(`https://127.0.0.1:${rstPort}/x`, { proxy: `http://127.0.0.1:${stuckPort}`, timeoutMs: 300 }).catch((e) => e);
+  assert.match(slow.message, /请求超时/);
+  assert.equal(slow.beforeConnect, undefined);
+  // 响应超限：不重试，也不能把进程搞崩
+  const big = http.createServer((req, res) => { res.writeHead(200); res.end(Buffer.alloc(64 * 1024)); });
+  const bigPort = await listen(big);
+  const tooBig = await telegramHttp(`http://127.0.0.1:${bigPort}/x`, { maxBytes: 1024 }).catch((e) => e);
+  assert.match(tooBig.message, /字节上限/);
+  assert.equal(tooBig.beforeConnect, undefined);
+  // 收到一半断了：已经连上了
+  const partial = http.createServer((req, res) => { res.writeHead(200, { 'content-length': 100000 }); res.write(Buffer.alloc(1000)); setTimeout(() => req.socket.destroy(), 20); });
+  const partialPort = await listen(partial);
+  const cut = await telegramHttp(`http://127.0.0.1:${partialPort}/x`, { maxBytes: 1 << 20 }).catch((e) => e);
+  assert.ok(cut instanceof Error, '中途断开要报错');
+  assert.equal(cut.beforeConnect, false);
+  for (const server of [hangup, rst, stuck, big, partial]) server.close();
+});
+
+await test('keep-alive：复用连接时监听器不累积', async () => {
+  const warnings = [];
+  const onWarning = (w) => warnings.push(w);
+  process.on('warning', onWarning);
+  let connections = 0;
+  const server = http.createServer((req, res) => { res.end('{"ok":true,"result":{}}'); });
+  server.on('connection', () => { connections += 1; });
+  const port = await listen(server);
+  for (let i = 0; i < 30; i++) await telegramHttp(`http://127.0.0.1:${port}/x`);
+  await new Promise((r) => setImmediate(r));
+  process.off('warning', onWarning);
+  server.closeAllConnections();
+  server.close();
+  assert.ok(connections < 30, `应复用连接（实际新建 ${connections} 个）`);
+  assert.ok(!warnings.some((w) => w.name === 'MaxListenersExceededWarning'), '复用的连接上不能攒监听器');
+});
+
+await test('网络错误重试：握手前断的都重试，握手后断的只重试只读方法', async () => {
   const fakeClient = (errors) => {
     const calls = [];
     const c = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE, http: async (url) => {
@@ -389,21 +437,24 @@ await test('网络错误：握手前断的都重试，握手后断的只重试�
   };
   const pre = { msg: 'Client network socket disconnected before secure TLS connection was established', beforeConnect: true };
   const post = { msg: 'socket hang up', beforeConnect: false };
-  let f = fakeClient([pre, pre]);
+  let f = fakeClient([pre, pre, pre, pre]);
   assert.equal((await f.c.sendText(1, 'hi')).message_id, 7);
-  assert.equal(f.calls.length, 3, '握手前断的 sendMessage 可以重试（没发出去）');
-  f = fakeClient([pre, pre, pre]);
+  assert.equal(f.calls.length, 5, '握手前断的 sendMessage 可以重试（没发出去），最多四次');
+  f = fakeClient([pre, pre, pre, pre, pre]);
   await assert.rejects(f.c.sendText(1, 'hi'), /网络错误/);
-  assert.equal(f.calls.length, 3, '最多重试两次');
+  assert.equal(f.calls.length, 5);
   f = fakeClient([post]);
   await assert.rejects(f.c.sendText(1, 'hi'), /socket hang up/);
   assert.equal(f.calls.length, 1, '握手后断的 sendMessage 不重试，免得发两遍');
-  f = fakeClient([post]);
-  await f.c.getMe();
-  assert.equal(f.calls.length, 2, '只读方法握手后断的也重试');
+  f = fakeClient([post, post, post]);
+  await assert.rejects(f.c.getMe(), /socket hang up/);
+  assert.equal(f.calls.length, 3, '只读方法握手后断的重试两次');
   f = fakeClient([{ msg: '请求超时（20000ms）' }]);
   await assert.rejects(f.c.getMe(), /超时/);
   assert.equal(f.calls.length, 1, '超时不重试');
+  f = fakeClient([{ msg: '响应超过 1024 字节上限', noRetry: true }]);
+  await assert.rejects(f.c.getMe(), /上限/);
+  assert.equal(f.calls.length, 1, '超限不重试');
 });
 
 // ── 3. 长轮询 ─────────────────────────────────────────────────────────

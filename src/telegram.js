@@ -180,19 +180,31 @@ function openTunnel(proxyUrl, host, port, signal) {
  * 发一个 HTTP 请求，返回 { status, buffer }。
  * maxBytes 超限直接中断（防止被一个超大响应撑爆内存）。
  */
+// 直连 Telegram 用自己的连接池：Node 默认的空闲连接 5 秒就关，隔一会儿再请求就得新建连接，
+// 而代理节点不稳时恰恰是新连接容易在 TLS 握手时被掐断。只关空闲连接，不影响长轮询。
+const TG_AGENTS = {
+  'https:': new https.Agent({ keepAlive: true, timeout: 60000 }),
+  'http:': new http.Agent({ keepAlive: true, timeout: 60000 })
+};
+
 export async function telegramHttp(url, { method = 'GET', json, body: rawBody, contentType, proxy = '', timeoutMs = 20000, maxBytes = MAX_JSON_BYTES, signal } = {}) {
   const target = new URL(url);
   const isHttps = target.protocol === 'https:';
   const port = Number(target.port) || (isHttps ? 443 : 80);
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  const timeoutError = () => new Error(`请求超时（${timeoutMs}ms）`);
   const body = rawBody ?? (json === undefined ? null : Buffer.from(JSON.stringify(json)));
+  // 网络错误标上 beforeConnect：连接（https 是 TLS 握手）完成之前就断的为 true，请求肯定没发出去，
+  // 重试不会重复发；之后断的为 false，可能已经到了 Telegram。超时、调用方取消不标（不重试）。
+  let connected = false;
   const options = {
     method,
     hostname: target.hostname,
     port,
     path: target.pathname + target.search,
     headers: body ? { 'content-type': contentType || 'application/json', 'content-length': body.length } : {},
+    agent: TG_AGENTS[target.protocol],
     signal: combined
   };
   if (proxy) {
@@ -200,40 +212,57 @@ export async function telegramHttp(url, { method = 'GET', json, body: rawBody, c
     try {
       socket = await openTunnel(proxy, target.hostname, port, combined);
     } catch (error) {
-      error.beforeConnect = !timeoutSignal.aborted;
+      if (timeoutSignal.aborted) throw timeoutError();
+      if (!signal?.aborted) error.beforeConnect = true;
       throw error;
     }
-    options.createConnection = () => (isHttps ? tls.connect({ socket, servername: target.hostname }) : socket);
+    // 每个请求一条自己的隧道：走连接池的话可能复用旧连接，刚建的隧道就白白挂着
+    options.agent = false;
+    options.createConnection = () => {
+      if (!isHttps) { connected = true; return socket; }
+      const tlsSocket = tls.connect({ socket, servername: target.hostname });
+      tlsSocket.once('secureConnect', () => { connected = true; });
+      return tlsSocket;
+    };
   }
   return await new Promise((resolve, reject) => {
-    // 连接（https 是 TLS 握手）完成之前就断掉的，请求肯定没发出去，重试不会重复发；
-    // 握手之后断的可能已经到了 Telegram。复用的 keep-alive 连接一开始就是连好的。
-    let connected = false;
+    let settled = false;
+    const fail = (error, { afterConnect = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutSignal.aborted) { reject(timeoutError()); return; }
+      if (!signal?.aborted && error.noRetry !== true) error.beforeConnect = afterConnect ? false : !connected;
+      reject(error);
+    };
     const req = (isHttps ? https : http).request(options, (res) => {
       const chunks = [];
       let size = 0;
       res.on('data', (chunk) => {
         size += chunk.length;
         if (size > maxBytes) {
-          req.destroy(new Error(`响应超过 ${maxBytes} 字节上限`));
+          // 超限重试也没用；不带错误地销毁，免得 socket 上冒出没人接的 error
+          fail(Object.assign(new Error(`响应超过 ${maxBytes} 字节上限`), { noRetry: true }));
+          req.destroy();
           return;
         }
         chunks.push(chunk);
       });
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, buffer: Buffer.concat(chunks) }));
-      res.on('error', reject);
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve({ status: res.statusCode ?? 0, buffer: Buffer.concat(chunks) });
+      });
+      // 收到一半断了（比如下载大图时）：已经连上了
+      res.on('error', (error) => fail(error, { afterConnect: true }));
+      res.on('aborted', () => fail(new Error('响应中途断开'), { afterConnect: true }));
     });
     req.on('socket', (socket) => {
-      if (!socket.connecting && (!isHttps || socket.encrypted)) connected = true;
+      if (proxy) return;
+      // 复用的 keep-alive 连接早就连好了；新连接等握手完成。别在复用的连接上挂监听器：事件不会再来，会一直攒着
+      if (req.reusedSocket) { connected = true; return; }
       socket.once(isHttps ? 'secureConnect' : 'connect', () => { connected = true; });
     });
-    req.on('error', (error) => {
-      if (timeoutSignal.aborted) reject(new Error(`请求超时（${timeoutMs}ms）`));
-      else {
-        error.beforeConnect = !connected && !signal?.aborted;
-        reject(error);
-      }
-    });
+    req.on('error', (error) => fail(error));
     if (body) req.write(body);
     req.end();
   });
@@ -273,20 +302,27 @@ export class TelegramApiError extends Error {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 代理节点不稳时，新连接常在 TLS 握手阶段被掐断（Client network socket disconnected before secure
-// TLS connection was established）。这种请求没发出去，什么方法都能重试；握手后才断的只重试只读方法，
-// 免得一条消息发两遍。超时、调用方取消不重试。
-const NETWORK_RETRY_DELAYS_MS = [300, 1000];
+// TLS connection was established）。这种请求没发出去，什么方法都能重试，失败得也快，多给几次；
+// 握手后才断的只重试只读方法，免得一条消息发两遍。超时、调用方取消、响应超限不重试。
+const PRE_CONNECT_RETRY_DELAYS_MS = [300, 600, 1000, 1500];
+const POST_CONNECT_RETRY_DELAYS_MS = [300, 1000];
 const IDEMPOTENT_METHODS = new Set(['getMe', 'getFile', 'getStickerSet', 'getChat', 'getChatMember']);
 
 async function withNetworkRetry(fn, { idempotent = false, signal } = {}) {
-  for (let attempt = 0; ; attempt++) {
+  let pre = 0;
+  let post = 0;
+  for (;;) {
     try {
       return await fn();
     } catch (error) {
-      const retryable = (error?.beforeConnect === true || (idempotent && error?.beforeConnect === false))
-        && !signal?.aborted && attempt < NETWORK_RETRY_DELAYS_MS.length;
-      if (!retryable) throw error;
-      await sleep(NETWORK_RETRY_DELAYS_MS[attempt]);
+      if (signal?.aborted) throw error;
+      if (error?.beforeConnect === true && pre < PRE_CONNECT_RETRY_DELAYS_MS.length) {
+        await sleep(PRE_CONNECT_RETRY_DELAYS_MS[pre++]);
+      } else if (idempotent && error?.beforeConnect === false && post < POST_CONNECT_RETRY_DELAYS_MS.length) {
+        await sleep(POST_CONNECT_RETRY_DELAYS_MS[post++]);
+      } else {
+        throw error;
+      }
     }
   }
 }
