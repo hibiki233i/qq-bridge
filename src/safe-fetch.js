@@ -132,6 +132,28 @@ function orderAddresses(addresses) {
   return ordered;
 }
 
+// 代理 TUN 的 fake-ip 模式（Clash / Surge / sing-box 等）：系统 DNS 把**所有**域名都解析到
+// 198.18.0.0/15（IPv6 常见 fdfe:dcba:9876::/48），真实解析和连接由代理完成。这时本机看不到真实地址，
+// 放行任意域名就等于让代理替任何人连本机/内网，所以只对下面这些固定的公网服务放行：
+// QQ 的图片/表情 CDN，和联网搜索用的两个接口。其余域名照旧拦（网页抓取在 fake-ip 下用不了，
+// 要用就在代理里把它们加进 fake-ip-filter）。
+const FAKE_IP_TRUSTED_HOSTS = ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'api.deepseek.com', 'cn.bing.com'];
+const FAKE_IP_TRUSTED_SUFFIXES = ['.qpic.cn', '.qlogo.cn'];
+
+export function isFakeIp(ip) {
+  const h = String(ip || '').toLowerCase();
+  if (net.isIP(h) === 4) {
+    const [a, b] = h.split('.').map(Number);
+    return a === 198 && (b === 18 || b === 19);
+  }
+  return net.isIP(h) === 6 && h.startsWith('fdfe:dcba:9876:');
+}
+
+export function fakeIpTrustedHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  return FAKE_IP_TRUSTED_HOSTS.includes(h) || FAKE_IP_TRUSTED_SUFFIXES.some((suffix) => h.endsWith(suffix));
+}
+
 /** 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。 */
 export async function resolveSafeAddresses(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
@@ -150,9 +172,15 @@ export async function resolveSafeAddresses(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
-  for (const { address } of addresses) {
-    if (isPrivateIp(address)) {
-      throw new Error('域名解析到内网/本机地址，已阻止');
+  // 只有**全部**结果都在 fake-ip 池里才算 fake-ip；混着真实内网地址的照样拦
+  const allFakeIp = addresses.every(({ address }) => isFakeIp(address));
+  if (!(allFakeIp && fakeIpTrustedHost(h))) {
+    for (const { address } of addresses) {
+      if (isPrivateIp(address)) {
+        throw new Error(allFakeIp
+          ? '域名解析到 198.18.x.x（看起来是代理的 fake-ip 模式），这个域名不在放行名单里，已阻止'
+          : '域名解析到内网/本机地址，已阻止');
+      }
     }
   }
   const ordered = orderAddresses(addresses);

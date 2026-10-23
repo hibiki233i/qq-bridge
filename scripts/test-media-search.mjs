@@ -382,6 +382,30 @@ await test('safe-fetch：多地址时按 IPv4 优先并在失败后切换', asyn
   }
 });
 
+await test('safe-fetch：代理 fake-ip 下只放行 QQ 图片 CDN 和搜索接口', async () => {
+  const { default: dns } = await import('node:dns');
+  const original = dns.promises.lookup;
+  let answer = [];
+  dns.promises.lookup = async () => answer;
+  try {
+    const mod = await import(`../src/safe-fetch.js?fakeip=${Date.now()}`);
+    answer = [{ address: '198.18.2.148', family: 4 }];
+    for (const host of ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'gchat.qpic.cn', 'q1.qlogo.cn', 'api.deepseek.com', 'cn.bing.com']) {
+      assert.deepEqual(await mod.resolveSafeAddresses(host), ['198.18.2.148'], host);
+    }
+    await assert.rejects(mod.resolveSafeAddresses('example.com'), /fake-ip/, '名单外的域名照样拦，并说明是 fake-ip');
+    await assert.rejects(mod.resolveSafeAddresses('evilqpic.cn'), /已阻止/, '后缀要带点匹配');
+    await assert.rejects(mod.resolveSafeAddresses('localhost.qq.com'), /已阻止/, '不是整个 qq.com 都放行');
+    await assert.rejects(mod.resolveSafeAddresses('198.18.2.148'), /禁止访问/, '直接写 IP 不放行');
+    answer = [{ address: '198.18.2.148', family: 4 }, { address: '127.0.0.1', family: 4 }];
+    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com'), /内网\/本机/, '混着真实内网地址时不算 fake-ip');
+    answer = [{ address: '10.0.0.8', family: 4 }];
+    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com'), /内网\/本机/, '名单里的域名解析到真实内网照样拦');
+  } finally {
+    dns.promises.lookup = original;
+  }
+});
+
 // ── 搜索：空结果 note 必须进入缓存（否则 5 分钟内重复查询拿不到提示） ────────────
 // 不能真联网，所以这里是**结构断言**：note 走的是 `value = {...value, note}`（新建对象），
 // 而缓存存的是引用；先 cache.set 再加 note ⇒ 命中缓存时拿到的正是那个没有 note 的旧对象，
