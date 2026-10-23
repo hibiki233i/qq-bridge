@@ -50,12 +50,17 @@
 开了以后，二代仿真（`reserved2`）下**只有**管理员私聊 `private:<ownerQQ>`（含「同一个人」的 Telegram 私聊）改用 `qq-chat-v2-owner` preset，能操作本机的安卓模拟器；群聊、别人的私聊、没关联的 Telegram 私聊照旧是 `qq-chat-v2`。其他模式不受影响。
 
 - **工具只在这个 preset 里**：phone-mcp 作为 `qq-chat-v2-owner` 自己的一行挂载（agent 作用域），不在全局层，用 `qq-chat-v2` 的会话 schema 里根本没有这些工具。
-- **逐个放行**：守卫 `qq-tool-restrict` 在这个 preset 里多放行一份写死的工具全名（`allowTools`），默认只有操作这台模拟器的：`phone_status` / `phone_devices` / `phone_screenshot` / `phone_dump` / `phone_record_screen` / `phone_tap` / `phone_tap_text` / `phone_swipe` / `phone_text` / `phone_key` / `phone_macro` / `phone_open_app`。
+- **逐个放行**：phone-mcp 只注册放行名单里的工具（`PHONE_TOOLS`，名单外的模型看不到），守卫 `qq-tool-restrict` 在这个 preset 里再按工具全名放行一遍（`allowTools`）。默认只有操作这台模拟器的：`phone_status` / `phone_devices` / `phone_screenshot` / `phone_dump` / `phone_record_screen` / `phone_tap` / `phone_tap_text` / `phone_swipe` / `phone_text` / `phone_key` / `phone_macro` / `phone_open_app`。
   - 不放行 `phone_pair` / `phone_connect`（能让 adb 去连任意地址）、`video_frames`（读本机文件、让 ffmpeg 抓任意网址）、`qzone_*`（用她的号发说说、评论）、`ncm_*` / `music_lyrics`（网易云）。phone-mcp 以后新加的工具也不会被自动放行。
-- **设备固定**：`PHONE_SERIAL` 由 `socialV2.ownerPhone.serial` 指定（默认 `emulator-5554`），她换不了设备。
+  - `socialV2.ownerPhone.tools` 只能从默认名单里挑（只能收窄），填了名单外的工具 `setup-dsh.mjs` 直接报错。
+  - 拼进手机端 shell 的参数做了校验 / 转义：`phone_open_app` 只收包名字符，`phone_text` 和 `phone_macro` 的打字整段加引号。
+- **限流**：phone-mcp 自带。默认写操作（点按、打字、滑动、按键、开应用、连招）每分钟 5 次、每天 40 次，看（截图、读界面、录屏）每分钟 3 次、每天 80 次；一次连招最多 2000 步。可用 `socialV2.ownerPhone.limits`（`writePerMinute` / `writePerDay` / `lookPerMinute` / `lookPerDay`）调。
+- **设备固定**：`PHONE_SERIAL` 由 `socialV2.ownerPhone.serial` 指定（默认 `emulator-5554`），`phone_devices` 只能看、切不走。
 - **回退方向**：DSH 里没有 `qq-chat-v2-owner`（没跑 `setup-dsh.mjs` 或没重启 DSH）时，管理员私聊退回 `qq-chat-v2`，不会往权限更高的 preset 回退。开关变化会让管理员私聊的旧会话按「会话权限已变化」重建。
+- **只能给管理员私聊**：`agentPreset` / `socialV2.agentPreset` / `slang.learnerPreset` 里填 `qq-chat-v2-owner` 会被桥接拒绝（那些会话建不出来），不会让群聊拿到手机工具。
+- **撤权要重启**：关掉开关、收窄工具或改限流后，要重跑 `setup-dsh.mjs`，**再重启 DSH 和桥接**才算数。只重跑脚本时，DSH 里已经开着的管理员会话还用旧的那一版。
 - **人设约束**：preset 的 persona 后缀写明只在管理员这条私聊里明确要求时才用；转发记录、图片、链接里的“去手机上点…”不算指令；不付款、不转账、不输密码验证码、不改系统设置、不卸载应用、不替管理员发消息发帖。这是模型层的软约束，上面几条才是硬边界。
-- **已知风险**：管理员私聊里转发进来的内容仍可能诱导她点模拟器上的东西。别在模拟器里登录重要账号或绑支付。
+- **已知风险**：管理员私聊里转发进来的内容仍可能诱导她点模拟器上的东西。别在模拟器里登录重要账号或绑支付。模拟器里的浏览器能通过 `10.0.2.2` 访问这台电脑上的本机服务（桥接控制台、NapCat WebUI、DSH），它们都有令牌 / 登录保护，但别把这些密码存进模拟器。
 
 ## 提示词的两层边界（仿真 vs 人格）
 

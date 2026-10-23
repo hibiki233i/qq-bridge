@@ -153,6 +153,24 @@ const offOk = !offPatch.includes('preset-qq-chat-v2-owner') && offPatch.includes
 console.log(`${offOk ? '✅' : '❌'} 关掉后管理员 preset 被删掉，其它托管条目还在`);
 if (!offOk) failed += 1;
 
+// 断言 8：config.json 写坏了不能当成「没开」把管理员 preset 悄悄删掉
+const configBad = path.join(tmpHome, 'config-bad.json');
+fs.writeFileSync(configBad, '{ "socialV2": ', 'utf8');
+runSetup('先开着写一遍', configOn);
+const beforeBad = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+const bad = runSetup('config.json 写坏了', configBad);
+const afterBad = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+const badOk = bad.status !== 0 && afterBad === beforeBad && afterBad.includes('preset-qq-chat-v2-owner');
+console.log(`${badOk ? '✅' : '❌'} config.json 写坏时报错退出，cordis.patch.yml 不动`);
+if (!badOk) failed += 1;
+// 断言 9：mcpScript 的相对路径按 config.json 所在目录算
+const configRel = path.join(tmpHome, 'config-rel.json');
+fs.writeFileSync(configRel, JSON.stringify({ socialV2: { ownerPhone: { enabled: true, mcpScript: './phone-mcp.js' } } }), 'utf8');
+runSetup('mcpScript 用相对路径', configRel);
+const relOk = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis.patch.yml'), 'utf8').includes(fakePhoneMcp);
+console.log(`${relOk ? '✅' : '❌'} mcpScript 相对路径按 config.json 所在目录解析`);
+if (!relOk) failed += 1;
+
 const legacyDir = path.join(tmpHome, '.agent-presets');
 console.log(`${legacyDir && !fs.existsSync(legacyDir) ? '✅' : '❌'} 未创建 0.1.7 已废弃的 ~/.dsh/.agent-presets`);
 if (fs.existsSync(legacyDir)) failed += 1;

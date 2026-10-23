@@ -155,9 +155,10 @@ const OWNER_BASE_PRESET = 'qq-chat-v2';
 const OWNER_SOURCE = path.join(REPO_ROOT, 'dsh', 'owner-presets', `${OWNER_PRESET}.yml`);
 
 /**
- * 默认放行的 phone-mcp 工具：只操作这台模拟器的。
+ * 默认放行的 phone-mcp 工具：只操作这台模拟器的。ownerPhone.tools 只能从这里面挑（只能收窄）。
  * 不放：phone_pair / phone_connect（能让 adb 去连任意地址）、video_frames（读本机文件、让 ffmpeg 抓任意网址）、
  * qzone_*（用她的号发说说、评论）、ncm_* / music_lyrics（网易云，含聊天室发言）。
+ * phone_devices 留着：PHONE_SERIAL 设了之后它只能看、切不走设备（phone-mcp 自己挡）。
  */
 export const DEFAULT_OWNER_PHONE_TOOLS = Object.freeze([
   'phone_status', 'phone_devices', 'phone_screenshot', 'phone_dump', 'phone_record_screen',
@@ -165,19 +166,32 @@ export const DEFAULT_OWNER_PHONE_TOOLS = Object.freeze([
 ]);
 
 const PHONE_SERIAL_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+// phone-mcp 的限流（每分钟 / 每天），对应它的 PHONE_WRITE_* / PHONE_LOOK_* 环境变量；不填就用 phone-mcp 的默认值
+const PHONE_LIMIT_ENV = {
+  writePerMinute: 'PHONE_WRITE_PER_MINUTE', writePerDay: 'PHONE_WRITE_PER_DAY',
+  lookPerMinute: 'PHONE_LOOK_PER_MINUTE', lookPerDay: 'PHONE_LOOK_PER_DAY',
+};
 const PHONE_TOOL_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/; // phone-mcp 自己的工具名，不带 mcp__phone__ 前缀
 
 /**
  * 管理员私聊 preset 的 @deepseek-ai/dsh-agent-preset 行：qq-chat-v2 的行列表 + 手机。
- * @param {{ nodePath: string, phoneScript: string, serial: string, tools?: string[] }} opts
+ * @param {{ nodePath: string, phoneScript: string, serial: string, tools?: string[], limits?: Record<string, number> }} opts
  */
-export function renderOwnerPresetRow({ nodePath, phoneScript, serial, tools = DEFAULT_OWNER_PHONE_TOOLS }) {
+export function renderOwnerPresetRow({ nodePath, phoneScript, serial, tools = DEFAULT_OWNER_PHONE_TOOLS, limits = {} }) {
   if (!path.isAbsolute(String(nodePath ?? ''))) throw new Error('ownerPhone：node 路径必须是绝对路径');
   if (!path.isAbsolute(String(phoneScript ?? ''))) throw new Error('ownerPhone：phone-mcp 路径必须是绝对路径');
   if (!PHONE_SERIAL_RE.test(String(serial ?? ''))) throw new Error(`ownerPhone.serial 不合法：${JSON.stringify(serial)}（例如 emulator-5554 或 127.0.0.1:5555）`);
   const toolList = [...new Set(tools)];
   if (!toolList.length || !toolList.every((t) => typeof t === 'string' && t.length <= 64 && PHONE_TOOL_RE.test(t))) {
     throw new Error('ownerPhone.tools 必须是非空的 phone-mcp 工具名列表（例如 phone_tap）');
+  }
+  const outside = toolList.filter((t) => !DEFAULT_OWNER_PHONE_TOOLS.includes(t));
+  if (outside.length) throw new Error(`ownerPhone.tools 只能从默认名单里挑（只能收窄）：${outside.join(', ')} 不在里面`);
+  const limitEnv = {};
+  for (const [key, value] of Object.entries(limits ?? {})) {
+    if (!PHONE_LIMIT_ENV[key]) throw new Error(`ownerPhone.limits 不认识 ${key}（可用：${Object.keys(PHONE_LIMIT_ENV).join(' / ')}）`);
+    if (!Number.isInteger(value) || value <= 0 || value > 100000) throw new Error(`ownerPhone.limits.${key} 必须是正整数`);
+    limitEnv[PHONE_LIMIT_ENV[key]] = String(value);
   }
   const meta = readYaml(OWNER_SOURCE);
   for (const field of ['name', 'description', 'order', 'suffix']) {
@@ -203,7 +217,8 @@ export function renderOwnerPresetRow({ nodePath, phoneScript, serial, tools = DE
       transport: 'stdio',
       command: nodePath,
       args: [phoneScript],
-      env: { PHONE_SERIAL: serial },
+      // PHONE_TOOLS：phone-mcp 只注册这些工具，名单外的模型根本看不到（守卫的 allowTools 再兜一层）
+      env: { PHONE_SERIAL: serial, PHONE_TOOLS: toolList.join(','), ...limitEnv },
       // 录屏最长 60 秒再抽帧，DSH 默认 60 秒会提前掐断
       toolCallTimeoutMs: 180000,
     },

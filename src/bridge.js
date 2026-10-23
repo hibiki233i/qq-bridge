@@ -3353,6 +3353,12 @@ async function main() {
   function resolvePresetName(name, { strict = false } = {}) {
     const wanted = String(name ?? '').trim();
     if (!wanted) return strict ? '' : (dshDefaultPreset || '');
+    // 管理员私聊专用的 preset（带手机工具）只能由 ownerPhonePreset() 给 private:<ownerQQ> 选；
+    // 群聊 / 学习会话的配置项里填了它（填错、复制粘贴错）也一律拒绝，绝不让群聊拿到手机工具。
+    if (wanted === 'qq-chat-v2-owner' && strict) {
+      log('⛔ 配置里把管理员私聊专用的 preset "qq-chat-v2-owner" 填给了群聊/其他会话，已拒绝；它只能通过 socialV2.ownerPhone 给管理员私聊用');
+      return '';
+    }
     // DSH 可能接受未知 preset 并套用默认值；清单未知时也必须 fail-closed。
     if (dshPresetIds.length === 0) return strict ? '' : wanted;
     if (dshPresetIds.includes(wanted)) return wanted;

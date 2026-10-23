@@ -134,18 +134,22 @@ const DEFAULT_PHONE_MCP = path.resolve(REPO_ROOT, '..', 'ai-companion-kit', 'pac
 
 /** config.json 的 socialV2.ownerPhone：没开返回 null；开了但不能用就报错退出（不留半截配置）。 */
 function ownerPhoneOptions() {
+  if (!fs.existsSync(CONFIG_FILE)) return null;
   let config;
+  // 读坏了不能当成「没开」悄悄删掉管理员 preset：直接停下，让人去修 config.json
   try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8').replace(/^\uFEFF/, '')); }
-  catch { return null; }
+  catch (error) { fatal(`读不了 ${CONFIG_FILE}（${error.message}）；修好再跑，cordis.patch.yml 没动`); }
   const op = config?.socialV2?.ownerPhone;
   if (!op || op.enabled !== true) return null;
-  const phoneScript = path.resolve(String(op.mcpScript || DEFAULT_PHONE_MCP));
+  // 相对路径按 config.json 所在目录算，不按运行脚本时的当前目录
+  const phoneScript = op.mcpScript ? path.resolve(path.dirname(CONFIG_FILE), String(op.mcpScript)) : DEFAULT_PHONE_MCP;
   if (!fs.existsSync(phoneScript)) fatal(`socialV2.ownerPhone 已开启，但找不到 phone-mcp：${phoneScript}（装好 ai-companion-kit，或在 ownerPhone.mcpScript 填它的路径）`);
   return {
     nodePath: process.execPath,
     phoneScript,
     serial: String(op.serial || 'emulator-5554'),
     ...(Array.isArray(op.tools) ? { tools: op.tools } : {}),
+    ...(op.limits && typeof op.limits === 'object' ? { limits: op.limits } : {}),
   };
 }
 

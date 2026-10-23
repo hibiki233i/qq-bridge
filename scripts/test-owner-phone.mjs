@@ -77,5 +77,15 @@ await test('开关一变，管理员私聊的会话策略跟着变（旧会话�
   });
 });
 
+await test('管理员 preset 填给群聊 / 学习会话的配置项：拒绝', async () => {
+  await withHarness({ enabled: true }, (h) => {
+    h.cfg.socialV2.agentPreset = 'qq-chat-v2-owner';
+    assert.equal(h.modePreset('group:20002', 'reserved2', h.cfg), undefined, '群聊建不出会话，也不会带上手机工具');
+    assert.equal(h.modePreset('private:30003', 'reserved2', h.cfg), undefined);
+    assert.equal(h.modePreset(`private:${OWNER}`, 'reserved2', h.cfg), 'qq-chat-v2-owner', '管理员私聊照常');
+    assert.equal(h.resolvePresetName('qq-chat-v2-owner', { strict: true }), '');
+  });
+});
+
 console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  tests=${tests} failures=${failures}`);
 if (failures) process.exit(1);
