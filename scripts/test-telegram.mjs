@@ -1011,6 +1011,10 @@ await test('桥接：贴纸包默认关闭（公开的），不打开就不建',
     assert.match(h.buildWakePromptV2('private:tg111', 'private'), /qq_collect_sticker 收藏，会存进QQ 收藏表情/, '默认只存 QQ 收藏');
     h.cfg.telegram.stickers.copyToQQ = false;
     assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), '两个去处都关着就不提收藏');
+    // QQ 会话：收藏开着时照常提，管理端关掉收藏后也不提
+    assert.match(h.buildWakePromptV2('private:222', 'private'), /qq_collect_sticker/);
+    h.cfg.socialV2.sticker = { ...(h.cfg.socialV2.sticker ?? {}), collect: { enabled: false } };
+    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:222', 'private')), '收藏关了就不提收藏');
   } finally { await h.close(); }
 });
 

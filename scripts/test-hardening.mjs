@@ -61,6 +61,8 @@ assert(block.split('\n').filter((l) => l.startsWith('- ')).length === 1,
   '一个表情只占一行：注入内容无法靠换行脱离数据块');
 assert(buildStickerContext([], 8) === '', '空库不产出提示块');
 assert(typeof buildStickerStrategyHint() === 'string' && buildStickerStrategyHint().length > 0, '策略提示仍在');
+assert(buildStickerStrategyHint().includes('qq_collect_sticker') && !buildStickerStrategyHint({ collect: false }).includes('qq_collect_sticker'),
+  '收藏不了时策略提示不提 qq_collect_sticker');
 
 // ── 3. 黑话库限长与上限 ─────────────────────────────────────────────────
 const long = normalizeSlangEntry({ content: 'x'.repeat(500), meaning: 'y'.repeat(999), evidence: [{ text: 'z'.repeat(500), sender: 'a' }] });
