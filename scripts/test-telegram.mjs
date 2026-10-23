@@ -943,6 +943,9 @@ await test('桥接：Telegram 会话里收藏贴纸 → 列表里看得到 → �
       const img = await consoleCall(port, `/api/socialV2/sticker-image?key=private%3Atg111&stickerId=${encodeURIComponent(favId)}`, { token: st.agentToken });
       assert.equal(img.status, 200, img.body);
       assert.equal(img.json.image.mimeType, 'image/png', '动态贴纸看缩略图');
+      const members = await consoleCall(port, '/api/socialV2/group-members?key=group%3Atg-100500');
+      assert.equal(members.status, 400);
+      assert.match(members.json.error, /Telegram 群拿不到成员列表/, 'Telegram 群直接说清楚，不报「格式不对」');
       botApi.calls.length = 0;
       const send = await consoleCall(port, '/api/socialV2/send-sticker', { method: 'POST', token: st.agentToken, body: { key: 'private:tg111', stickerId: favId, replyToMessageId: 31 } });
       assert.equal(send.status, 200, send.body);
@@ -1015,6 +1018,11 @@ await test('桥接：贴纸包默认关闭（公开的），不打开就不建',
     assert.match(h.buildWakePromptV2('private:222', 'private'), /qq_collect_sticker/);
     h.cfg.socialV2.sticker = { ...(h.cfg.socialV2.sticker ?? {}), collect: { enabled: false } };
     assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:222', 'private')), '收藏关了就不提收藏');
+    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), 'Telegram 上收藏关了也不提');
+    h.cfg.socialV2.sticker.collect.enabled = true;
+    h.cfg.telegram.stickers.copyToQQ = true;
+    h.cfg.socialV2.tools = { ...(h.cfg.socialV2.tools ?? {}), collectSticker: false };
+    assert.ok(!/qq_collect_sticker/.test(h.buildWakePromptV2('private:tg111', 'private')), '收藏工具关了 Telegram 上也不提');
   } finally { await h.close(); }
 });
 

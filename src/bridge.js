@@ -3974,9 +3974,12 @@ async function main() {
           return;
         }
         if (!hasToken) {
+          // 群成员列表是 v2 形态的端点，但 closed-agent 里模型没有令牌；只在这个模式、只放这一条 GET，
+          // 端点自己再按群白名单判定。reserved2 下照样必须带令牌。
           const tokenlessAgentAllowed = url.pathname === '/api/status'
             || url.pathname.startsWith('/api/send/')
-            || url.pathname.startsWith('/api/images/');
+            || url.pathname.startsWith('/api/images/')
+            || (currentMode === 'closed-agent' && req.method === 'GET' && url.pathname === '/api/socialV2/group-members');
           if (!tokenlessAgentAllowed) {
             sendJson({ ok: false, error: '未授权：该接口的智能体调用必须携带有效的会话令牌' }, 403);
             return;
@@ -6140,7 +6143,7 @@ async function main() {
               if (!accepted) { sendJson({ ok: false, error: '贴纸不是可识别的图片' }, 400); return; }
               const prep = await toModelMedia(accepted.buffer, accepted.mimeType, `Telegram 贴纸 ${fav.id}`);
               if (!prep.ok) { sendJson({ ok: false, error: `贴纸图片无法提供给模型：${prep.error}` }, 413); return; }
-              sendJson({ ok: true, key, sticker: { id: fav.id, emoji: fav.emoji, note: fav.note, format: fav.format }, image: { mimeType: prep.mimeType, data: prep.buffer.toString('base64') } });
+              sendJson({ ok: true, key, sticker: { id: fav.id, emoji: fav.emoji, note: fav.note, format: fav.format }, image: { mimeType: prep.mimeType, data: prep.buffer.toString('base64') }, ...(prep.note ? { note: prep.note } : {}) });
             } catch (error) {
               sendJson({ ok: false, error: `获取贴纸图片失败：${error?.message ?? error}` }, 500);
             }
@@ -7293,8 +7296,9 @@ async function main() {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          const groupMatch = /^group:(\d+)$/.exec(key);
-          if (!groupMatch) { sendJson({ ok: false, error: '群成员只能按 group:群号 查询' }, 400); return; }
+          const groupMatch = parseConvKey(key);
+          if (groupMatch?.telegram) { sendJson({ ok: false, error: 'Telegram 群拿不到成员列表；要找人用消息里 tg 开头的 id' }, 400); return; }
+          if (groupMatch?.kind !== 'group') { sendJson({ ok: false, error: '群成员只能按 group:群号 查询' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           // ⚠️ 白名单/模式判定**不能**挂在「有令牌」条件里：closed-agent 的代理调用本来就不带令牌
           // （它走的是操作者路径），只按 header 判断会让它拿任意群号去枚举成员 ——
@@ -7304,11 +7308,11 @@ async function main() {
           // 于是「管理员在私聊里让 AI 看看某群成员」会 403 —— 那是旧工具本来支持的能力，
           // 属于这次改动不该带走的回归。所以 closed-agent 下按**同样严格的白名单**放行群读取。
           const groupMembersAllowed = currentMode === 'closed-agent'
-            ? allowed('group', Number(groupMatch[1]), cfg)
+            ? allowed('group', groupMatch.id, cfg)
             : v2SessionAllowed(key);
           if (!groupMembersAllowed) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getGroupMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_group_members' }, 403); return; }
-          const groupId = Number(groupMatch[1]);
+          const groupId = groupMatch.id;
           try {
             let response;
             try {
@@ -11104,12 +11108,13 @@ async function main() {
 
   /** 这个会话里 qq_collect_sticker 能不能用：工具开着、收藏没关，Telegram 上还得至少有一个去处。 */
   function canCollectStickerV2(key) {
-    if (!v2ToolEnabled('collectSticker') || cfg.socialV2?.sticker?.collect?.enabled === false) return false;
-    return parseConvKey(key)?.telegram === true ? telegramCollectHint() !== '' : true;
+    if (parseConvKey(key)?.telegram === true) return telegramCollectHint() !== '';
+    return v2ToolEnabled('collectSticker') && cfg.socialV2?.sticker?.collect?.enabled !== false;
   }
 
   /** 告诉她在 Telegram 上收藏的东西会存到哪。两个去处都关着就不提收藏。 */
   function telegramCollectHint() {
+    if (!v2ToolEnabled('collectSticker') || cfg.socialV2?.sticker?.collect?.enabled === false) return '';
     const sc = cfg.telegram?.stickers ?? {};
     const places = [sc.favorites === true && tg.stickers ? '你的 Telegram 贴纸包' : '', sc.copyToQQ !== false ? 'QQ 收藏表情（在 QQ 上也能发）' : ''].filter(Boolean);
     return places.length ? `看到喜欢的贴纸可以用 qq_collect_sticker 收藏，会存进${places.join('，并存一份到')}。` : '';

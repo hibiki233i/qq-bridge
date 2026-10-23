@@ -110,7 +110,8 @@ await test('closed-agent（管理员私聊，无令牌）仍能查白名单群�
   const get = (query) => new Promise((resolve, reject) => {
     const req = http.request({ hostname: '127.0.0.1', port: server.address().port,
       path: `/api/socialV2/group-members?key=${encodeURIComponent(KEY)}${query}`,
-      method: 'GET', headers: { 'x-console-token': 'fixture-console-token' } }, (res) => {
+      // 和真实 MCP 一样带 x-agent-call（mcp-snowluma-safe 的 agentHeaders 一律带上）
+      method: 'GET', headers: { 'x-console-token': 'fixture-console-token', 'x-agent-call': '1' } }, (res) => {
       let data = ''; res.setEncoding('utf8');
       res.on('data', (c) => { data += c; });
       res.on('end', () => { try { resolve({ status: res.statusCode, data: JSON.parse(data) }); } catch (e) { reject(e); } });
@@ -125,7 +126,7 @@ await test('closed-agent（管理员私聊，无令牌）仍能查白名单群�
     const denied = await new Promise((resolve, reject) => {
       const req = http.request({ hostname: '127.0.0.1', port: server.address().port,
         path: '/api/socialV2/group-members?key=group%3A999999', method: 'GET',
-        headers: { 'x-console-token': 'fixture-console-token' } }, (res) => {
+        headers: { 'x-console-token': 'fixture-console-token', 'x-agent-call': '1' } }, (res) => {
         let data = ''; res.setEncoding('utf8');
         res.on('data', (c) => { data += c; });
         res.on('end', () => resolve({ status: res.statusCode, data: JSON.parse(data) }));
@@ -134,6 +135,10 @@ await test('closed-agent（管理员私聊，无令牌）仍能查白名单群�
     });
     assert.equal(denied.status, 403, `closed-agent 也不能枚举非白名单群：${JSON.stringify(denied.data)}`);
     assert.equal(st.agentToken.length > 0, true);
+    // 仿真模式下无令牌的智能体调用照样被总闸拦下
+    h.setMode('reserved2');
+    const tokenless = await get('');
+    assert.equal(tokenless.status, 403, `reserved2 下无令牌必须拒绝：${JSON.stringify(tokenless.data)}`);
   } finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
 });
 
