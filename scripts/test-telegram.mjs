@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   normalizeTelegramConfig, normalizeTelegramLinks, telegramConfigProblems, tgChatIdOf, tgConvId, isTelegramConvId,
-  updateToEvent, createTelegramMessageCache, TelegramClient, startTelegramPolling
+  updateToEvent, createTelegramMessageCache, TelegramClient, startTelegramPolling, telegramHttp
 } from '../src/telegram.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { toForm, applyForm } from './config-gui.mjs';
@@ -365,6 +365,45 @@ await test('走 HTTP CONNECT 代理', async () => {
   const dead = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE, proxy: 'http://127.0.0.1:1' });
   const err = await dead.getMe().catch((e) => e);
   assert.match(err.message, /连不上代理/);
+});
+
+await test('网络错误：握手前断的都重试，握手后断的只重试只读方法', async () => {
+  // telegramHttp 标记错误发生在连上之前还是之后
+  const refused = await telegramHttp('http://127.0.0.1:1/x').catch((e) => e);
+  assert.equal(refused.beforeConnect, true, '连接被拒：请求没发出去');
+  const hangup = http.createServer((req) => req.socket.destroy());
+  await new Promise((r) => hangup.listen(0, '127.0.0.1', r));
+  const after = await telegramHttp(`http://127.0.0.1:${hangup.address().port}/x`, { method: 'POST', json: {} }).catch((e) => e);
+  hangup.close();
+  assert.equal(after.beforeConnect, false, '连上后才断：请求可能已经到了');
+  // 重试策略（用假的 http，按顺序吐出错误）
+  const fakeClient = (errors) => {
+    const calls = [];
+    const c = new TelegramClient({ botToken: BOT_TOKEN, apiBase: API_BASE, http: async (url) => {
+      calls.push(url);
+      const e = errors.shift();
+      if (e) throw Object.assign(new Error(e.msg ?? 'boom'), e);
+      return { status: 200, buffer: Buffer.from(JSON.stringify({ ok: true, result: { message_id: 7 } })) };
+    } });
+    return { c, calls };
+  };
+  const pre = { msg: 'Client network socket disconnected before secure TLS connection was established', beforeConnect: true };
+  const post = { msg: 'socket hang up', beforeConnect: false };
+  let f = fakeClient([pre, pre]);
+  assert.equal((await f.c.sendText(1, 'hi')).message_id, 7);
+  assert.equal(f.calls.length, 3, '握手前断的 sendMessage 可以重试（没发出去）');
+  f = fakeClient([pre, pre, pre]);
+  await assert.rejects(f.c.sendText(1, 'hi'), /网络错误/);
+  assert.equal(f.calls.length, 3, '最多重试两次');
+  f = fakeClient([post]);
+  await assert.rejects(f.c.sendText(1, 'hi'), /socket hang up/);
+  assert.equal(f.calls.length, 1, '握手后断的 sendMessage 不重试，免得发两遍');
+  f = fakeClient([post]);
+  await f.c.getMe();
+  assert.equal(f.calls.length, 2, '只读方法握手后断的也重试');
+  f = fakeClient([{ msg: '请求超时（20000ms）' }]);
+  await assert.rejects(f.c.getMe(), /超时/);
+  assert.equal(f.calls.length, 1, '超时不重试');
 });
 
 // ── 3. 长轮询 ─────────────────────────────────────────────────────────

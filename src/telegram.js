@@ -196,10 +196,19 @@ export async function telegramHttp(url, { method = 'GET', json, body: rawBody, c
     signal: combined
   };
   if (proxy) {
-    const socket = await openTunnel(proxy, target.hostname, port, combined);
+    let socket;
+    try {
+      socket = await openTunnel(proxy, target.hostname, port, combined);
+    } catch (error) {
+      error.beforeConnect = !timeoutSignal.aborted;
+      throw error;
+    }
     options.createConnection = () => (isHttps ? tls.connect({ socket, servername: target.hostname }) : socket);
   }
   return await new Promise((resolve, reject) => {
+    // 连接（https 是 TLS 握手）完成之前就断掉的，请求肯定没发出去，重试不会重复发；
+    // 握手之后断的可能已经到了 Telegram。复用的 keep-alive 连接一开始就是连好的。
+    let connected = false;
     const req = (isHttps ? https : http).request(options, (res) => {
       const chunks = [];
       let size = 0;
@@ -214,9 +223,16 @@ export async function telegramHttp(url, { method = 'GET', json, body: rawBody, c
       res.on('end', () => resolve({ status: res.statusCode ?? 0, buffer: Buffer.concat(chunks) }));
       res.on('error', reject);
     });
+    req.on('socket', (socket) => {
+      if (!socket.connecting && (!isHttps || socket.encrypted)) connected = true;
+      socket.once(isHttps ? 'secureConnect' : 'connect', () => { connected = true; });
+    });
     req.on('error', (error) => {
       if (timeoutSignal.aborted) reject(new Error(`请求超时（${timeoutMs}ms）`));
-      else reject(error);
+      else {
+        error.beforeConnect = !connected && !signal?.aborted;
+        reject(error);
+      }
     });
     if (body) req.write(body);
     req.end();
@@ -256,12 +272,32 @@ export class TelegramApiError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 代理节点不稳时，新连接常在 TLS 握手阶段被掐断（Client network socket disconnected before secure
+// TLS connection was established）。这种请求没发出去，什么方法都能重试；握手后才断的只重试只读方法，
+// 免得一条消息发两遍。超时、调用方取消不重试。
+const NETWORK_RETRY_DELAYS_MS = [300, 1000];
+const IDEMPOTENT_METHODS = new Set(['getMe', 'getFile', 'getStickerSet', 'getChat', 'getChatMember']);
+
+async function withNetworkRetry(fn, { idempotent = false, signal } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const retryable = (error?.beforeConnect === true || (idempotent && error?.beforeConnect === false))
+        && !signal?.aborted && attempt < NETWORK_RETRY_DELAYS_MS.length;
+      if (!retryable) throw error;
+      await sleep(NETWORK_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 export class TelegramClient {
-  /** @param {{ botToken: string, apiBase?: string, proxy?: string }} opts */
-  constructor({ botToken, apiBase = DEFAULT_API_BASE, proxy = '' }) {
+  /** @param {{ botToken: string, apiBase?: string, proxy?: string, http?: typeof telegramHttp }} opts */
+  constructor({ botToken, apiBase = DEFAULT_API_BASE, proxy = '', http: httpImpl = telegramHttp }) {
     this.token = botToken;
     this.apiBase = apiBase.replace(/\/+$/, '');
     this.proxy = proxy;
+    this.http = httpImpl;
   }
 
   /** 任何要打日志/回给调用方的文字都过一遍，别让 bot token 跟着 URL 漏出去。 */
@@ -274,11 +310,11 @@ export class TelegramClient {
     let res;
     try {
       const payload = file ? buildMultipart(params, file) : null;
-      res = await telegramHttp(`${this.apiBase}/bot${this.token}/${method}`, {
+      res = await withNetworkRetry(() => this.http(`${this.apiBase}/bot${this.token}/${method}`, {
         method: 'POST',
         ...(payload ? { body: payload.body, contentType: payload.contentType } : { json: params }),
         proxy: this.proxy, timeoutMs, signal
-      });
+      }), { idempotent: IDEMPOTENT_METHODS.has(method), signal });
     } catch (error) {
       throw new TelegramApiError(this.redact(`Telegram ${method} 网络错误：${error?.message ?? error}`), 'network');
     }
@@ -420,9 +456,9 @@ export class TelegramClient {
     const encoded = filePath.split('/').map(encodeURIComponent).join('/');
     let res;
     try {
-      res = await telegramHttp(`${this.apiBase}/file/bot${this.token}/${encoded}`, {
+      res = await withNetworkRetry(() => this.http(`${this.apiBase}/file/bot${this.token}/${encoded}`, {
         proxy: this.proxy, timeoutMs: 30000, maxBytes
-      });
+      }), { idempotent: true });
     } catch (error) {
       throw new Error(this.redact(`下载 Telegram 文件失败：${error?.message ?? error}`));
     }
