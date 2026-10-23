@@ -55,7 +55,7 @@
   - `socialV2.ownerPhone.tools` 只能从默认名单里挑（只能收窄），填了名单外的工具 `setup-dsh.mjs` 直接报错。
   - 拼进手机端 shell 的参数做了校验 / 转义：`phone_open_app` 只收包名字符，`phone_text` 和 `phone_macro` 的打字整段加引号。
 - **限流**：phone-mcp 自带。默认写操作（点按、打字、滑动、按键、开应用、连招）每分钟 5 次、每天 40 次，看（截图、读界面、录屏）每分钟 3 次、每天 80 次；一次连招最多 2000 步。可用 `socialV2.ownerPhone.limits`（`writePerMinute` / `writePerDay` / `lookPerMinute` / `lookPerDay`）调。
-- **截图缓存**：截图存在本机 `系统临时目录/phone-mcp-shots`，phone-mcp 启动时和之后每小时删掉超过 24 小时的（`PHONE_SHOT_MAX_AGE_HOURS` 可调），录屏的视频和抽出来的帧返回后马上删；`node <phone-mcp.js> --clean-shots` 手动全清。模拟器里只有几个固定文件名（`/sdcard/_dsh_shot.png`、`_dsh_rec.mp4`、`_dsh_ui.xml` 等），每次覆盖，不会越攒越多。
+- **截图缓存**：截图存在本机 `系统临时目录/phone-mcp-shots`，phone-mcp 启动时和之后每小时删掉超过 24 小时的（`PHONE_SHOT_MAX_AGE_HOURS` 可调），录屏的视频和抽出来的帧返回后马上删；`node <phone-mcp.js> --clean-shots` 手动全清。保留时长要在启动 DSH 的环境里设（setup-dsh 不传它）。注意 DSH 会把每张发给模型的图另存在 `~/.dsh/attachments/v1/`，**永远不删**，phone-mcp 管不了；手动删会让引用过这些图的会话读历史时报错。模拟器里只有几个固定文件名（`/sdcard/_dsh_shot.png`、`_dsh_rec.mp4`、`_dsh_ui.xml` 等），每次覆盖，不会越攒越多。
 - **设备固定**：`PHONE_SERIAL` 由 `socialV2.ownerPhone.serial` 指定（默认 `emulator-5554`），`phone_devices` 只能看、切不走。
 - **回退方向**：DSH 里没有 `qq-chat-v2-owner`（没跑 `setup-dsh.mjs` 或没重启 DSH）时，管理员私聊退回 `qq-chat-v2`，不会往权限更高的 preset 回退。开关变化会让管理员私聊的旧会话按「会话权限已变化」重建。
 - **只能给管理员私聊**：`agentPreset` / `socialV2.agentPreset` / `slang.learnerPreset` 里填 `qq-chat-v2-owner` 会被桥接拒绝（那些会话建不出来），不会让群聊拿到手机工具。
