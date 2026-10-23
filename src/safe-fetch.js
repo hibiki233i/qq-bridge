@@ -135,9 +135,10 @@ function orderAddresses(addresses) {
 // 代理 TUN 的 fake-ip 模式（Clash / Surge / sing-box 等）：系统 DNS 把**所有**域名都解析到
 // 198.18.0.0/15（IPv6 常见 fdfe:dcba:9876::/48），真实解析和连接由代理完成。这时本机看不到真实地址，
 // 放行任意域名就等于让代理替任何人连本机/内网，所以只对下面这些固定的公网服务放行：
-// QQ 的图片/表情 CDN，和联网搜索用的两个接口。其余域名照旧拦（网页抓取在 fake-ip 下用不了，
-// 要用就在代理里把它们加进 fake-ip-filter）。
-const FAKE_IP_TRUSTED_HOSTS = ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'api.deepseek.com', 'cn.bing.com'];
+// QQ 的图片/表情 CDN，和联网搜索用的接口；而且只在调用方明确要（allowFakeIp）、走默认端口时才认。
+// 抓图（safeFetchBuffer）默认认，联网搜索显式打开；web_fetch 不认——它的 URL 可能被提示注入操控，
+// 网页抓取在 fake-ip 下用不了，要用就在代理里把域名加进 fake-ip-filter。
+const FAKE_IP_TRUSTED_HOSTS = ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'api.deepseek.com', 'cn.bing.com', 'www.bing.com'];
 const FAKE_IP_TRUSTED_SUFFIXES = ['.qpic.cn', '.qlogo.cn'];
 
 export function isFakeIp(ip) {
@@ -154,8 +155,11 @@ export function fakeIpTrustedHost(hostname) {
   return FAKE_IP_TRUSTED_HOSTS.includes(h) || FAKE_IP_TRUSTED_SUFFIXES.some((suffix) => h.endsWith(suffix));
 }
 
-/** 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。 */
-export async function resolveSafeAddresses(hostname) {
+/**
+ * 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。
+ * allowFakeIp：名单里的域名解析到 fake-ip 时只连 fake-ip 地址（交给代理）；调用方要自己保证是默认端口。
+ */
+export async function resolveSafeAddresses(hostname, { allowFakeIp = false } = {}) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (!h) throw new Error('主机名为空');
   if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) {
@@ -172,15 +176,16 @@ export async function resolveSafeAddresses(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
-  // 只有**全部**结果都在 fake-ip 池里才算 fake-ip；混着真实内网地址的照样拦
-  const allFakeIp = addresses.every(({ address }) => isFakeIp(address));
-  if (!(allFakeIp && fakeIpTrustedHost(h))) {
-    for (const { address } of addresses) {
-      if (isPrivateIp(address)) {
-        throw new Error(allFakeIp
-          ? '域名解析到 198.18.x.x（看起来是代理的 fake-ip 模式），这个域名不在放行名单里，已阻止'
-          : '域名解析到内网/本机地址，已阻止');
-      }
+  // fake-ip 下只连 fake-ip 地址：一起返回的 AAAA（真实公网 v6，或 sing-box 的 fc00:: 假地址）直接丢掉；
+  // 但混着真实的 IPv4 内网地址就不对劲了，整条拦。
+  const fake = addresses.filter(({ address }) => isFakeIp(address));
+  const realPrivateV4 = addresses.some(({ address }) => net.isIP(address) === 4 && !isFakeIp(address) && isPrivateIp(address));
+  if (allowFakeIp && fake.length && !realPrivateV4 && fakeIpTrustedHost(h)) return orderAddresses(fake);
+  for (const { address } of addresses) {
+    if (isPrivateIp(address)) {
+      throw new Error(fake.length && !realPrivateV4
+        ? '域名解析到 198.18.x.x（看起来是代理的 fake-ip 模式），只有 QQ 图片 CDN 和联网搜索认这种地址，已阻止'
+        : '域名解析到内网/本机地址，已阻止');
     }
   }
   const ordered = orderAddresses(addresses);
@@ -192,7 +197,7 @@ export async function resolveSafeHost(hostname) {
   return first;
 }
 
-export async function validateFetchUrl(raw) {
+export async function validateFetchUrl(raw, { allowFakeIp = false } = {}) {
   let url;
   try {
     url = new URL(String(raw ?? '').trim());
@@ -201,7 +206,8 @@ export async function validateFetchUrl(raw) {
   }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('仅允许 http/https');
   if (url.username || url.password) throw new Error('URL 不能包含凭据');
-  const addresses = await resolveSafeAddresses(url.hostname);
+  // fake-ip 只认默认端口：名单里的域名再怎么可信，也不能拿来让代理连别的端口
+  const addresses = await resolveSafeAddresses(url.hostname, { allowFakeIp: allowFakeIp && url.port === '' });
   return { url, ip: addresses[0], addresses };
 }
 
@@ -355,16 +361,16 @@ async function requestOnce(url, addresses, limit, binary = false) {
   throw lastError ?? new Error(`请求失败：${url.hostname}`);
 }
 
-export async function safeFetch(urlString, maxChars = 50000) {
+export async function safeFetch(urlString, maxChars = 50000, { allowFakeIp = false } = {}) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
-  let { url, addresses } = await validateFetchUrl(urlString);
+  let { url, addresses } = await validateFetchUrl(urlString, { allowFakeIp });
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, addresses, maxChars);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, addresses } = await validateFetchUrl(next));
+      ({ url, addresses } = await validateFetchUrl(next, { allowFakeIp }));
       continue;
     }
     const body = result.body || '';
@@ -388,17 +394,17 @@ export function looksLikeImageBuffer(buf) {
   return false;
 }
 
-/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。只抓 QQ 图片，默认认 fake-ip。 */
+export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024, { allowFakeIp = true } = {}) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
-  let { url, addresses } = await validateFetchUrl(urlString);
+  let { url, addresses } = await validateFetchUrl(urlString, { allowFakeIp });
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, addresses, maxBytes, true);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
-      ({ url, addresses } = await validateFetchUrl(next));
+      ({ url, addresses } = await validateFetchUrl(next, { allowFakeIp }));
       continue;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {

@@ -179,7 +179,7 @@ async function validateSearchEndpoint(baseURL) {
   }
   if (url.protocol !== 'https:') throw new Error('webSearch.baseURL 必须是 https（API key 只能发给加密端点）');
   if (url.username || url.password) throw new Error('webSearch.baseURL 不能包含凭据');
-  const addresses = await resolveSafeAddresses(url.hostname);
+  const addresses = await resolveSafeAddresses(url.hostname, { allowFakeIp: url.port === '' });
   return { url, addresses };
 }
 
@@ -416,7 +416,7 @@ export async function bingSearch(query, config = defaultConfig) {
   rss.searchParams.set('setlang', 'zh-hans');
   rss.searchParams.set('cc', 'CN');
   try {
-    const res = await safeFetch(rss.toString(), 512000);
+    const res = await safeFetch(rss.toString(), 512000, { allowFakeIp: true });
     if (res.statusCode >= 200 && res.statusCode < 300) {
       const results = parseBingRss(res.body, maxResults);
       if (results.length) return results;
@@ -427,7 +427,7 @@ export async function bingSearch(query, config = defaultConfig) {
   html.searchParams.set('count', String(Math.min(20, maxResults)));
   html.searchParams.set('setlang', 'zh-hans');
   html.searchParams.set('cc', 'CN');
-  const res = await safeFetch(html.toString(), 512000);
+  const res = await safeFetch(html.toString(), 512000, { allowFakeIp: true });
   if (res.statusCode < 200 || res.statusCode >= 300) throw new Error(`Bing 搜索 HTTP ${res.statusCode}`);
   return parseBingHtml(res.body, maxResults);
 }

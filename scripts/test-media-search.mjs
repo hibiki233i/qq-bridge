@@ -389,18 +389,31 @@ await test('safe-fetch：代理 fake-ip 下只放行 QQ 图片 CDN 和搜索接�
   dns.promises.lookup = async () => answer;
   try {
     const mod = await import(`../src/safe-fetch.js?fakeip=${Date.now()}`);
+    const fakeOk = { allowFakeIp: true };
     answer = [{ address: '198.18.2.148', family: 4 }];
-    for (const host of ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'gchat.qpic.cn', 'q1.qlogo.cn', 'api.deepseek.com', 'cn.bing.com']) {
-      assert.deepEqual(await mod.resolveSafeAddresses(host), ['198.18.2.148'], host);
+    for (const host of ['multimedia.nt.qq.com.cn', 'gxh.vip.qq.com', 'gchat.qpic.cn', 'q1.qlogo.cn', 'api.deepseek.com', 'cn.bing.com', 'www.bing.com']) {
+      assert.deepEqual(await mod.resolveSafeAddresses(host, fakeOk), ['198.18.2.148'], host);
     }
-    await assert.rejects(mod.resolveSafeAddresses('example.com'), /fake-ip/, '名单外的域名照样拦，并说明是 fake-ip');
-    await assert.rejects(mod.resolveSafeAddresses('evilqpic.cn'), /已阻止/, '后缀要带点匹配');
-    await assert.rejects(mod.resolveSafeAddresses('localhost.qq.com'), /已阻止/, '不是整个 qq.com 都放行');
-    await assert.rejects(mod.resolveSafeAddresses('198.18.2.148'), /禁止访问/, '直接写 IP 不放行');
+    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com'), /fake-ip/, '调用方没要 allowFakeIp 就不认（web_fetch 走这条）');
+    await assert.rejects(mod.resolveSafeAddresses('example.com', fakeOk), /fake-ip/, '名单外的域名照样拦，并说明是 fake-ip');
+    await assert.rejects(mod.resolveSafeAddresses('evilqpic.cn', fakeOk), /已阻止/, '后缀要带点匹配');
+    await assert.rejects(mod.resolveSafeAddresses('localhost.qq.com', fakeOk), /已阻止/, '不是整个 qq.com 都放行');
+    await assert.rejects(mod.resolveSafeAddresses('198.18.2.148', fakeOk), /禁止访问/, '直接写 IP 不放行');
+    // 端口：只认默认端口
+    assert.deepEqual((await mod.validateFetchUrl('https://gxh.vip.qq.com:443/a.gif', fakeOk)).addresses, ['198.18.2.148']);
+    await assert.rejects(mod.validateFetchUrl('http://gxh.vip.qq.com:6099/', fakeOk), /fake-ip/, '非默认端口不认 fake-ip');
+    // safeFetch（web_fetch 用的）默认不认；safeFetchBuffer（抓图）默认认，但端口照样卡
+    await assert.rejects(mod.safeFetch('https://gxh.vip.qq.com/'), /fake-ip/);
+    await assert.rejects(mod.safeFetchBuffer('http://gxh.vip.qq.com:3000/'), /fake-ip/);
+    // 一起返回的 AAAA（真实公网 v6 / sing-box 的 fc00:: 假地址）丢掉，只连 fake-ip
+    answer = [{ address: '198.18.2.148', family: 4 }, { address: '240e:97c:2f:3::1', family: 6 }];
+    assert.deepEqual(await mod.resolveSafeAddresses('p.qpic.cn', fakeOk), ['198.18.2.148']);
+    answer = [{ address: '198.18.2.148', family: 4 }, { address: 'fc00::12', family: 6 }];
+    assert.deepEqual(await mod.resolveSafeAddresses('p.qpic.cn', fakeOk), ['198.18.2.148']);
     answer = [{ address: '198.18.2.148', family: 4 }, { address: '127.0.0.1', family: 4 }];
-    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com'), /内网\/本机/, '混着真实内网地址时不算 fake-ip');
+    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com', fakeOk), /内网\/本机/, '混着真实 IPv4 内网地址时整条拦');
     answer = [{ address: '10.0.0.8', family: 4 }];
-    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com'), /内网\/本机/, '名单里的域名解析到真实内网照样拦');
+    await assert.rejects(mod.resolveSafeAddresses('gxh.vip.qq.com', fakeOk), /内网\/本机/, '名单里的域名解析到真实内网照样拦');
   } finally {
     dns.promises.lookup = original;
   }
