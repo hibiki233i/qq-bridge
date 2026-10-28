@@ -59,14 +59,10 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
     if (row.name !== '@deepseek-ai/dsh-persona') throw new Error(`name=${row.name}`);
   });
   check('persona.config 通过 DSH schema', () => { persona.Config(row.config); });
-  check('保留了 {{model}} 变量', () => {
-    if (!/\{\{model\}\}/.test(row.config.prefix)) throw new Error('prefix 缺少 {{model}}');
-  });
   check('只引用 DSH 已注册的提示词变量（{{cwd}} 在 0.2.1 已不存在）', () => {
     const used = [...new Set([...JSON.stringify(row.config).matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1]))];
     const unknown = used.filter((v) => !DSH_PROMPT_VARIABLES.has(v));
     if (unknown.length > 0) throw new Error(`未知变量会让回合直接 error：${unknown.join(', ')}`);
-    if (!used.includes('model')) throw new Error('prefix 缺少 {{model}}');
   });
   check('不再包含已废弃的 text 字段', () => {
     if (Object.hasOwn(row.config, 'text')) throw new Error('仍有 text 字段');

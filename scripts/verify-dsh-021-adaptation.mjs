@@ -78,11 +78,11 @@ for (const p of ['qq-chat', 'qq-chat-v2']) {
   try { persona.Config(row.config); schemaOk = true; } catch {}
   check(`preset ${p}: persona.config 通过 DSH schema`, schemaOk);
   // 未知变量不是"渲染成空"而是 fail loud：回合直接 error、模型一次都不跑。
-  // 所以这里必须钉住「只用 DSH 真注册过的变量」，而不只是「有 {{model}}」。
+  // 所以这里必须钉住「只用 DSH 真注册过的变量」。qq-chat-v2 的人设不点名模型，不要求有 {{model}}。
   const usedVars = [...new Set([...JSON.stringify(row.config).matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1]))];
   const unknownVars = usedVars.filter((v) => !DSH_PROMPT_VARIABLES.has(v));
   check(`preset ${p}: 只引用 DSH 已注册的提示词变量`,
-    unknownVars.length === 0 && /\{\{model\}\}/.test(row.config.prefix),
+    unknownVars.length === 0,
     unknownVars.length ? `未知变量: ${unknownVars.join(', ')}` : usedVars.join(', '));
 }
 

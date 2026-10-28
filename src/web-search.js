@@ -469,7 +469,8 @@ export async function webSearch(query, options = {}) {
     try {
       value = await attemptDeepSeek();
     } catch (error) {
-      const reason = error?.code === 'NO_KEY' ? '未配置 DeepSeek 搜索凭据' : `DeepSeek 搜索不可用：${error?.message ?? error}`;
+      // 这句会进模型看到的工具结果：不点名厂商（人设不提具体模型），细节只留错误码。
+      const reason = error?.code === 'NO_KEY' ? '未配置首选搜索凭据' : `首选搜索不可用（${error?.code || 'ERROR'}）`;
       try {
         value = await attemptBing();
       } catch (bingError) {
