@@ -209,6 +209,55 @@ await test('only explicit signals count as addressed to her', async ({ h }) => {
   assert.equal(group([], '你吃饭了吗'), false);
 });
 
+await test('real group events are classified before they reach the gate', async ({ h, st }) => {
+  h.setSelfIdentity('🐳', '999');
+  h.cfg.socialV2.selfNames = ['小鲸鱼'];
+  const event = (text, extra = []) => ({ self_id: 999, user_id: 123, message_id: Math.floor(Math.random() * 1e9),
+    message: [...extra, { type: 'text', data: { text } }], raw_message: text, sender: { nickname: '群友', card: '群友' } });
+  await h.handleIncoming('group', '456', event('随便聊聊'), h.cfg);
+  assert.equal(st.lastDirectedIncomingAt || 0, 0, 'ordinary chatter is not addressed to her');
+  await h.handleIncoming('group', '456', event('🐳'), h.cfg);
+  assert.equal(st.lastDirectedIncomingAt || 0, 0, 'an emoji-only nickname does not count as calling her');
+  await h.handleIncoming('group', '456', event('小鲸鱼在吗'), h.cfg);
+  assert.ok(st.lastDirectedIncomingAt > 0, 'a configured self name counts');
+  st.lastDirectedIncomingAt = 0;
+  await h.handleIncoming('group', '456', event('看这个', [{ type: 'at', data: { qq: '999' } }]), h.cfg);
+  assert.ok(st.lastDirectedIncomingAt > 0, '@her counts');
+});
+
+await test('people she just talked to count as addressing her without @', async ({ h, st, append }) => {
+  append('a question from 789', { directed: false });
+  h.recordSentMessagesV2(KEY, ['her reply']);
+  st.lastDirectedIncomingAt = 0;
+  h.appendSocialV2Message(KEY, 'someone-else', 'unrelated', 'unrelated', false, false, 'other-1', [], '555', [], false);
+  assert.equal(st.lastDirectedIncomingAt, 0, 'someone she did not talk to is just chatter');
+  append('that 789 follow-up without @', { directed: false });
+  assert.ok(st.lastDirectedIncomingAt > 0, 'the person she answered is still talking to her');
+});
+
+await test('only pokes at her (or in private) count as addressing her', async ({ h, st }) => {
+  h.appendSocialV2Poke(KEY, { sender: 'a', userId: '1', targetId: '2', targetIsSelf: false, groupId: '456' });
+  assert.equal(st.lastDirectedIncomingAt || 0, 0);
+  h.appendSocialV2Poke(KEY, { sender: 'a', userId: '1', targetId: '999', targetIsSelf: true, groupId: '456' });
+  assert.ok(st.lastDirectedIncomingAt > 0);
+});
+
+await test('a close without a watermark still treats any new message as blocking', async ({ st, request, append }) => {
+  append('message before wait');
+  await request('unread');
+  const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 } });
+  const timer = setTimeout(() => append('chatter during observation', { directed: false }), 60);
+  let waited;
+  try { waited = await waiting; } finally { clearTimeout(timer); }
+  append('unseen chatter', { directed: false });
+  const legacy = await request('wake-config', { body: { config: DIVING } });
+  assert.equal(legacy.status, 400, 'without throughSeq the close would clear unseen chatter, so the old rule applies');
+  assert.deepEqual(seqs(st.unread), [1, 2, 3]);
+  const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
+  assert.equal(close.status, 200);
+  assert.deepEqual(seqs(st.unread), [3]);
+}, { observe: true });
+
 await test('a random wake tells her that nobody calling her is normal', async ({ h }) => {
   assert.match(h.buildWakePromptV2(KEY, 'probability@seq1'), /随机叫醒你看看群/);
   assert.match(h.buildWakePromptV2(KEY, 'probability'), /随机叫醒你看看群/);

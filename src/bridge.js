@@ -5491,7 +5491,7 @@ async function main() {
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
           // 如果当前已经是“潜水”唤醒配置，且最近还有对话/刚被唤醒，不允许用 mark_read 直接回到潜水；
           // 必须先等够沉睡前观察窗口，避免“聊两句又去潜水”。
-          if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
+          if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st, { strict: throughSeq === null })) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -5627,7 +5627,7 @@ async function main() {
             }
           }
           // 沉睡前强制观察窗口：除非对方明确结束、或已经安静/等待足够时间，否则不允许 AI 聊两句就设置潜水。
-          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st)) {
+          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st, { strict: throughSeq === null })) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -9148,7 +9148,8 @@ async function main() {
     return true; // diving 且不是 anyMessage 都视为“沉睡/潜水”，需要先观察
   }
 
-  function preSleepWaitBlockedV2(st) {
+  // strict：不带 throughSeq 的收尾会清掉全部未读（兼容语义），这时任何新消息都要拦，按旧规则判断。
+  function preSleepWaitBlockedV2(st, { strict = false } = {}) {
     if (!st) return false;
     const w = cfg.socialV2?.wake ?? {};
     if (w.preSleepWaitEnabled === false) return false;
@@ -9161,7 +9162,7 @@ async function main() {
     // 以前看的是任何新消息：热闹的群里，等待返回到她发出收尾之间几乎总有人说话，
     // 闸门就变成拼手速——DeepSeek 2 秒内收尾能过，Haiku 走网关 5~20 秒就一直被拒、绕不出来。
     // 不冲她来的闲聊不该把她留在原地；冲她来的消息仍然拦住，避免话说到一半就睡。
-    const lastDirected = st.lastDirectedIncomingAt || 0;
+    const lastDirected = (strict ? st.lastIncomingAt : st.lastDirectedIncomingAt) || 0;
     // 已经完整等过观察窗口且之后没有冲她来的新消息：放行。
     if (st.preSleepWaitSatisfiedAt && lastDirected <= st.preSleepWaitSatisfiedAt) return false;
     // 已经做过一次沉睡前观察（可能等到了新消息并已把新消息返回给 AI），只要 AI 之后没有参与、也没有冲她来的新消息，就允许直接沉睡。
@@ -10685,6 +10686,9 @@ async function main() {
         }
       }
     }
+    // 她刚和这个人聊过（见 recordSentMessagesV2）：对方不带 @ 接话也算冲她来。
+    const engagedUntil = userId != null ? Number(st.engagedUsers?.get(String(userId))) || 0 : 0;
+    if (engagedUntil > Date.now()) directedAtSelf = true;
     const msg = {
       seq: (st.lastUnreadSeq || 0) + 1,
       messageId: messageId != null ? String(messageId) : null,
@@ -10774,6 +10778,7 @@ async function main() {
     return msg;
   }
 
+  const ENGAGED_WINDOW_MS = 10 * 60 * 1000;
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);
     const now = Date.now();
@@ -10793,6 +10798,12 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    // 记下正在和她聊的人：发言前最近 3 条别人的消息（10 分钟内）的发言人，之后 10 分钟里他们说的话
+    // 都算冲她来（沉睡前观察闸门用）。她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。
+    if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
+    const recentOthers = st.recentMessages.filter((m) => m && !m.isSelf && m.userId && now - (Number(m.time) || 0) < ENGAGED_WINDOW_MS).slice(-3);
+    for (const m of recentOthers) st.engagedUsers.set(String(m.userId), now + ENGAGED_WINDOW_MS);
+    for (const [uid, until] of st.engagedUsers) if (until <= now) st.engagedUsers.delete(uid);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -10908,8 +10919,17 @@ async function main() {
     if (kind === 'private') return true;
     if (quoteTargetIsSelf) return true;
     if (Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''))) return true;
-    const name = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
-    return !!name && String(plainContent ?? '').toLowerCase().includes(name.toLowerCase());
+    const nick = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
+    // 纯表情/符号的昵称（本机是 🐳）不拿来认人：群友发个 🐳 不代表在叫她。
+    const names = [...(/\p{L}/u.test(nick || '') ? [nick] : []), ...selfNamesV2()];
+    const lower = String(plainContent ?? '').toLowerCase();
+    return names.some((name) => lower.includes(name.toLowerCase()));
+  }
+  // socialV2.selfNames：群友对她的称呼（如「小鲸鱼」）。只用于判断消息是不是冲她来，
+  // 不用唤醒关键词——那里有「DeepSeek」「DS」这种话题词，热闹的技术群会被当成一直在叫她。
+  function selfNamesV2() {
+    const list = cfg.socialV2?.selfNames;
+    return Array.isArray(list) ? list.map((n) => String(n ?? '').trim()).filter(Boolean) : [];
   }
 
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
@@ -11280,7 +11300,7 @@ async function main() {
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n先看看群里在聊什么、有没有人找你、对方说完没有，再决定发言、等待还是潜水。${/^probability\b/.test(String(reason)) ? '这次是随机叫醒你看看群，没人点名很正常——' : ''}没人叫你也可以插话：有一点想法、能吐槽或接梗就说一句，别一上来就划走。决定潜水前按上面的【沉睡前观察】先等够观察窗口。`;
+    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n先看看在聊什么、有没有人找你、对方说完没有，再决定发言、等待还是潜水。${parseConvKey(key)?.kind === 'group' ? `${/^probability\b/.test(String(reason)) ? '这次是随机叫醒你看看群，没人点名很正常——' : ''}没人叫你也可以插话：有一点想法、能吐槽或接梗就说一句，别一上来就划走。` : ''}决定潜水前按上面的【沉睡前观察】先等够观察窗口。`;
   }
 
   function buildWakeReminderPromptV2(key) {
