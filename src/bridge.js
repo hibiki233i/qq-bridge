@@ -6018,7 +6018,7 @@ async function main() {
           }
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId, quotedUserId: quotedInfo?.userId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -6032,7 +6032,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId, quotedUserId: quotedInfo?.userId });
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -6553,6 +6553,7 @@ async function main() {
             st.preSleepWaitSatisfiedAt = 0;
             st.preSleepWaitObservedAt = 0;
             st.preSleepWaitAccumMs = 0;
+            noteEngagedUsersV2(st, { replyToMessageId: actualReplyToMessageId, atUserId, quotedUserId: quotedInfo?.userId }, now);
             saveSocialV2State();
             scheduleReplyCheckV2(key);
             log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}`);
@@ -7759,7 +7760,7 @@ async function main() {
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId, quotedUserId: quotedInfo?.userId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -7770,7 +7771,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId, quotedUserId: quotedInfo?.userId });
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -10783,8 +10784,33 @@ async function main() {
     return msg;
   }
 
-  // replyToMessageId / atUserId：这次发言引用了谁、@ 了谁，用来记「正在和她聊的人」。
-  function recordSentMessagesV2(key, messages, { replyToMessageId = null, atUserId = null } = {}) {
+  // replyToMessageId / atUserId / quotedUserId：这次发言引用了谁、@ 了谁，用来记「正在和她聊的人」。
+  // 记下正在和她聊的人：她这次引用的那条消息的发言人、@ 的人；都没有就是她接的最新一条别人的消息
+  // 的发言人。之后一个观察窗口（默认 5 分钟）里这些人说的话都算冲她来（沉睡前观察闸门用）。
+  // 她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。只记她真正回的人：
+  // 热闹的群里把最近几条的发言人都算上，闸门又会被闲聊拦住。
+  // 取舍：不引用也不 @ 时只记最新一条的发言人；热闹群里她思考期间最新一条可能已经是别人，会记错。
+  function noteEngagedUsersV2(st, { replyToMessageId = null, atUserId = null, quotedUserId = null } = {}, now = Date.now()) {
+    if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
+    const windowMs = Math.max(60000, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    const targets = [];
+    if (quotedUserId != null && String(quotedUserId).trim() !== '') targets.push(String(quotedUserId).trim());
+    else if (replyToMessageId != null && String(replyToMessageId).trim() !== '') {
+      const quoted = st.recentMessages.find((m) => m && !m.isSelf && m.messageId != null && String(m.messageId) === String(replyToMessageId));
+      if (quoted?.userId) targets.push(String(quoted.userId));
+    }
+    if (atUserId != null && String(atUserId).trim() !== '') targets.push(String(atUserId).trim());
+    // 引用了但找不到发言人（已滚出 recentMessages、解析也没给 userId）时不瞎猜成最新一条的发言人。
+    const quotedSomething = replyToMessageId != null && String(replyToMessageId).trim() !== '';
+    if (!targets.length && !quotedSomething) {
+      const latest = [...st.recentMessages].reverse().find((m) => m && !m.isSelf && m.userId);
+      if (latest && now - (Number(latest.time) || 0) < windowMs) targets.push(String(latest.userId));
+    }
+    for (const uid of targets) st.engagedUsers.set(uid, now + windowMs);
+    for (const [uid, until] of st.engagedUsers) if (until <= now) st.engagedUsers.delete(uid);
+  }
+
+  function recordSentMessagesV2(key, messages, { replyToMessageId = null, atUserId = null, quotedUserId = null } = {}) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
@@ -10803,26 +10829,7 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
-    // 记下正在和她聊的人：她这次引用的那条消息的发言人、@ 的人；都没有就是她接的最新一条别人的消息
-    // 的发言人。之后一个观察窗口（默认 5 分钟）里这些人说的话都算冲她来（沉睡前观察闸门用）。
-    // 她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。只记她真正回的人：
-    // 热闹的群里把最近几条的发言人都算上，闸门又会被闲聊拦住。
-    if (list.length) {
-      if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
-      const windowMs = Math.max(60000, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-      const targets = [];
-      if (replyToMessageId != null && String(replyToMessageId).trim() !== '') {
-        const quoted = st.recentMessages.find((m) => m && !m.isSelf && m.messageId != null && String(m.messageId) === String(replyToMessageId));
-        if (quoted?.userId) targets.push(String(quoted.userId));
-      }
-      if (atUserId != null && String(atUserId).trim() !== '') targets.push(String(atUserId).trim());
-      if (!targets.length) {
-        const latest = [...st.recentMessages].reverse().find((m) => m && !m.isSelf && m.userId);
-        if (latest && now - (Number(latest.time) || 0) < windowMs) targets.push(String(latest.userId));
-      }
-      for (const uid of targets) st.engagedUsers.set(uid, now + windowMs);
-      for (const [uid, until] of st.engagedUsers) if (until <= now) st.engagedUsers.delete(uid);
-    }
+    if (list.length) noteEngagedUsersV2(st, { replyToMessageId, atUserId, quotedUserId }, now);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -10952,8 +10959,9 @@ async function main() {
     const lower = String(plainContent ?? '').toLowerCase();
     return names.some((name) => lower.includes(name.toLowerCase()));
   }
-  // socialV2.selfNames：群友对她的称呼（如「小鲸鱼」）。只用于判断消息是不是冲她来，
-  // 不用唤醒关键词——那里有「DeepSeek」「DS」这种话题词，热闹的技术群会被当成一直在叫她。
+  // socialV2.selfNames：群友对她的称呼（如「小鲸鱼」）。和昵称一起算「她的名字」：用于叫名字唤醒，
+  // 也用于判断消息是不是冲她来（闸门、限频分类）。不复用唤醒关键词——那里有「DeepSeek」「DS」
+  // 这种话题词，热闹的技术群会被当成一直在叫她。
   function selfNamesV2() {
     const list = cfg.socialV2?.selfNames;
     return Array.isArray(list) ? list.map((n) => String(n ?? '').trim()).filter(Boolean) : [];
@@ -10963,7 +10971,8 @@ async function main() {
   // 不让 anyMessage、关键词（「小鲸鱼」也在关键词里）抢先把它报成「其他」类、受每小时上限。
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     const reason = evaluateWakeTriggerBaseV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
-    if (!reason || reason === 'private') return reason;
+    // 已经是点名类（私聊/@/叫名字/提问）就不改报：「小鲸鱼你觉得呢？」按提问报，别降成 nameMention。
+    if (!reason || wakeClassV2(reason) === 'directed') return reason;
     return directedKindV2(event, kind, plainContent, quoteTargetIsSelf) || reason;
   }
 
@@ -11409,9 +11418,9 @@ async function main() {
         st.rateLimitRetryTimer = setTimeout(() => {
           st.rateLimitRetryTimer = null;
           const retryReason = st.rateLimitRetryReason || reason;
+          // 标记不在这里清：仍超额会再排一跳，标记要跟着走，直到真唤醒或 set_wake_config 才清。
           const hadTimerReason = !!st.rateLimitRetryHasTimerReason;
           st.rateLimitRetryReason = null;
-          st.rateLimitRetryHasTimerReason = false;
           // 消息类原因在重试前再确认一次：等待窗口里消息可能已被别的回合处理掉，
           // 没必要为一条已经处理过的消息再唤醒一次（定时器类原因与未读无关，不检查）。
           if (!hadTimerReason && !isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
@@ -11425,9 +11434,6 @@ async function main() {
       log(`[reserved2] 唤醒频率超限，${Math.round(waitMs / 1000)}s 后重试 ${key}（${st.rateLimitRetryReason}）`);
       return;
     }
-    // 真的唤醒了：排队中的限频重试就没用了（她醒着会自己看消息、重新定唤醒配置）。
-    // 不清的话，分类限频后点名类能绕过排着的「其他」类重试，过期的重试之后还会再叫醒她一次。
-    clearRateLimitRetryV2(st);
     // Only a real new wake resets observation; skipped/busy candidates must
     // preserve the current turn's progress through its required wait window.
     st.preSleepWaitSatisfiedAt = 0;
@@ -11489,6 +11495,10 @@ async function main() {
         // 不能在这里删除，否则补投的唤醒回合会丢失“未设置唤醒配置”的安全兜底。
         log(`[reserved2] 唤醒已入队 ${key}（${reason}），等待 DSH 恢复后补投`);
       }
+      // 投递成功（或已入队）才算真唤醒：排队中的限频重试就没用了（她醒着会自己看消息、重新定唤醒配置）。
+      // 不清的话，分类限频后点名类能绕过排着的「其他」类重试，过期的重试之后还会再叫醒她一次。
+      // 投递失败时留着，失败的这次唤醒不能把排着的回复检查/到点唤醒一起带走。
+      if (!(result && result.ok === false)) clearRateLimitRetryV2(st);
     } catch (error) {
       pendingWakeKeys.delete(key);
       disarmPendingWakeLease(key);
@@ -11626,7 +11636,12 @@ async function main() {
   }
 
   // 唤醒原因可能带子类型或 seq（如 keyword:小鲸鱼、speaker:昵称、atMention@seq194），取基名计算优先级。
+  // 先比限频类别再比原因：点名类永远压过「其他」类（例如指定成员 speaker 75 不能压过叫名字 70），
+  // 否则合并窗口/限频重试会把叫她的唤醒报成「其他」类，又被每小时上限卡住。
   function wakePriorityV2(reason) {
+    return (wakeClassV2(reason) === 'directed' ? 1000 : 0) + wakeBasePriorityV2(reason);
+  }
+  function wakeBasePriorityV2(reason) {
     const base = String(reason ?? '').split(/[:@]/)[0];
     return WAKE_PRIORITY[base] ?? 0;
   }

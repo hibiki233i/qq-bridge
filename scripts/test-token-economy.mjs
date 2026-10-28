@@ -657,14 +657,62 @@ await test('a successful wake cancels a stale queued retry', async ({ h, st, app
   assert.equal(st.rateLimitRetryReason, null);
 });
 
-await test('upgrading a queued timeout keeps it from being skipped on an empty unread list', async ({ h, st }) => {
-  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 12 });
-  st.wakeTimes = [Date.now() - 5000];
+await test('an upgraded timeout retry still fires on an empty unread list, across several hops', async ({ h, st }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  const hourAgo = Date.now() - 3600000;
+  st.wakeTimes = [hourAgo + 1200, hourAgo + 2600]; // 两跳之后才腾出额度
   await h.sendWakePromptV2(KEY, 'timeout');
-  await h.sendWakePromptV2(KEY, 'atMention');
-  assert.equal(st.rateLimitRetryReason, 'atMention');
-  assert.equal(st.rateLimitRetryHasTimerReason, true);
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼'); // 升级成消息类原因
+  assert.equal(st.rateLimitRetryReason, 'keyword:鲸鱼');
+  assert.deepEqual(seqs(st.unread), [], 'fixture: nothing unread, so a message-only retry would be skipped');
+  for (let i = 0; i < 80 && !h.calls.prompts.length; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(h.calls.prompts.length, 1, 'the timeout must not be lost when the retry hops more than once');
+  assert.equal(st.rateLimitRetryTimer, null);
+});
+
+await test('set_wake_config drops a queued timer retry but keeps a message retry', async ({ h, st, request, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  st.wakeTimes = minutesAgo(10);
+  await h.sendWakePromptV2(KEY, 'timeout');
+  assert.ok(st.rateLimitRetryTimer);
+  assert.equal((await request('wake-config', { body: { config: ACTIVE } })).status, 200);
+  assert.equal(st.rateLimitRetryTimer, null, 'the new wake config supersedes the queued timeout');
+  append('keyword message she has not read');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.ok(st.rateLimitRetryTimer);
+  assert.equal((await request('wake-config', { body: { config: ACTIVE } })).status, 200);
+  assert.ok(st.rateLimitRetryTimer, 'a message retry survives: she may not have seen that message');
+  assert.equal(st.rateLimitRetryHasTimerReason, false);
   stopRetry(st);
+});
+
+await test('a failed wake delivery keeps the queued retry', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  st.wakeTimes = minutesAgo(10);
+  await h.sendWakePromptV2(KEY, 'timeout');
+  assert.ok(st.rateLimitRetryTimer);
+  h.api.sessions.prompt = async (params) => {
+    h.calls.prompts.push(params);
+    return { result: { ok: false, error: { code: 'FIXTURE_REJECT', message: 'fixture rejection' } } };
+  };
+  append('@her');
+  await h.sendWakePromptV2(KEY, 'atMention');
+  assert.ok(st.rateLimitRetryTimer, 'the rejected wake must not take the queued timeout with it');
+  stopRetry(st);
+});
+
+await test('a speaker wake cannot outrank someone calling her by name in the batch window', async ({ h, st }) => {
+  h.setSelfIdentity('🐳', '999');
+  h.cfg.socialV2.selfNames = ['小鲸鱼'];
+  st.bootstrapSent = true;
+  st.wakeConfig.triggers = { speakerIds: ['123'], question: true };
+  const ev = (userId, text) => ({ self_id: 999, user_id: userId, message_id: Math.floor(Math.random() * 1e9),
+    message: [{ type: 'text', data: { text } }], raw_message: text, sender: { nickname: `u${userId}`, card: `u${userId}` } });
+  await h.handleIncoming('group', '456', ev(123, '我回来了'), h.cfg);
+  assert.match(String(st.pendingWakeReason), /^speaker:/);
+  await h.handleIncoming('group', '456', ev(456, '小鲸鱼你觉得呢？'), h.cfg);
+  assert.equal(st.pendingWakeReason, 'question', 'a question that names her stays a question and wins the merge');
+  clearTimeout(st.pendingWakeTimer); st.pendingWakeTimer = null;
 });
 
 await test('the person she quoted counts as talking to her, not just whoever spoke last', async ({ h, st }) => {

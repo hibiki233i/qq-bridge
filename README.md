@@ -159,7 +159,7 @@ QQ 网关（NapCat / SnowLuma）的地址和 token、DSH 地址、管理员和�
 | `snowluma.launcherPath` / `homeDir` | SnowLuma 安装目录（用于 token/端点自发现）。⚠️ 桥接**不会**启动或停止 SnowLuma（见 `LICENSE`） |
 | `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat`（改性格见下文） |
 | `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-v2` |
-| `socialV2.selfNames` | 群友对她的称呼，如 `["小鲸鱼"]`，默认空。只用来判断一条群消息是不是在跟她说话：她想潜水收尾前，跟她说话的消息会拦住收尾，别人的闲聊不拦。QQ 昵称（纯表情的除外）、@、引用她，以及她刚回过的人（她引用或 @ 的人，没有就是她接的最新一条的发言人，一个观察窗口内），本来就算在内。叫这些名字也算「点名」，唤醒不受每小时上限 |
+| `socialV2.selfNames` | 群友对她的称呼，如 `["小鲸鱼"]`，默认空。和 QQ 昵称一起算作「她的名字」，用在两处：开了叫名字唤醒时，叫这些名字会唤醒她，而且算点名，不受每小时上限；她想潜水收尾前，跟她说话的消息会拦住收尾，别人的闲聊不拦。**纯表情的 QQ 昵称（比如只有 🐳）不再拿来认人**，群友发个 🐳 不算叫她；昵称是纯表情时，要靠这里填的称呼才能被叫名字唤醒。判断「在跟她说话」时，@、引用她，以及她刚回过的人（她引用或 @ 的人；都没有就是她接的最新一条的发言人，一个观察窗口内）本来就算在内 |
 | `socialV2.ownerPhone` | 二代仿真下**只给管理员私聊**操作安卓模拟器（默认关）：`{ "enabled": true, "serial": "emulator-5554" }`。开了以后运行 `node scripts/setup-dsh.mjs` 并重启 DSH，`private:<ownerQQ>`（含「同一个人」的 Telegram 私聊）改用 `qq-chat-v2-owner` preset，群聊和别人的私聊不变。`mcpScript` 可指定 phone-mcp 路径（默认 `../ai-companion-kit/packages/phone-mcp/src/phone-mcp.js`），`tools` 可收窄放行的手机工具（只能收窄），`limits` 调 phone-mcp 的限流（`writePerMinute` / `writePerDay` / `lookPerMinute` / `lookPerDay`）。详见 RULES.md「管理员私聊的手机工具」 |
 | `socialV2.initialPromptMaxChars` | 会话「初始提示词」（控制台为某个群/私聊预写的环境说明）的字数上限，默认 2000，允许 100~8000。越界值会在启动时收敛并保持原文件不动 |
 | `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛 |
