@@ -44,8 +44,8 @@ async function test(name, run, { observe = false } = {}) {
     req.setTimeout(4000, () => req.destroy(new Error('fixture HTTP request timed out')));
     req.end(body === undefined ? undefined : JSON.stringify({ key, ...body }));
   });
-  const append = (text, { key = KEY, id = `fixture-${h.getSocialV2State(key).lastUnreadSeq + 1}`, media = [], forwards = [] } = {}) => {
-    h.appendSocialV2Message(key, 'fixture-person', text, text, false, false, id, media, '789', forwards);
+  const append = (text, { key = KEY, id = `fixture-${h.getSocialV2State(key).lastUnreadSeq + 1}`, media = [], forwards = [], directed } = {}) => {
+    h.appendSocialV2Message(key, 'fixture-person', text, text, false, false, id, media, '789', forwards, directed);
     return h.getSocialV2State(key).lastUnreadSeq;
   };
   try { await run({ h, st, request, append }); console.log('PASS', name); }
@@ -177,6 +177,60 @@ await test('wait exposes new messages and grants only their actually observed cu
   assert.equal(close.status, 200);
   assert.equal(close.data.markedCount, 2);
   assert.deepEqual(seqs(st.unread), []);
+}, { observe: true });
+
+// 热闹的群：等待返回到她发出收尾之间，别人又聊了一句（不冲她来）。以前这会让闸门一直拒绝，
+// 只有收尾足够快（DeepSeek 2 秒）才过得去；现在不冲她来的消息不拦收尾，也不作废观察。
+await test('busy group chatter after the observation does not block the close', async ({ st, request, append }) => {
+  append('message before wait');
+  await request('unread');
+  const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 } });
+  const timer = setTimeout(() => append('chatter during observation', { directed: false }), 60);
+  let waited;
+  try { waited = await waiting; } finally { clearTimeout(timer); }
+  assert.equal(waited.data.preSleepWaitObserved, true);
+  append('more chatter while the model thinks', { directed: false });
+  assert.ok(st.preSleepWaitObservedAt > 0, 'undirected chatter must not discard the observation');
+  const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
+  assert.equal(close.status, 200);
+  assert.equal(close.data.markedCount, 2);
+  assert.deepEqual(seqs(st.unread), [3], 'the unseen chatter stays unread');
+}, { observe: true });
+
+await test('only explicit signals count as addressed to her', async ({ h }) => {
+  h.setSelfIdentity('鲸鱼娘', '10001');
+  const group = (message, plainText, quoteSelf = false) => h.isDirectedAtSelfV2({ self_id: 10001, message }, 'group', plainText, quoteSelf);
+  assert.equal(h.isDirectedAtSelfV2({ self_id: 10001, message: [] }, 'private', 'hi', false), true);
+  assert.equal(group([{ type: 'at', data: { qq: '10001' } }], 'look'), true);
+  assert.equal(group([{ type: 'at', data: { qq: '20002' } }], 'look'), false);
+  assert.equal(group([], 'replying to you', true), true);
+  assert.equal(group([], '鲸鱼娘今天怎么这么安静'), true);
+  // 群友之间互相提问不算：用的是明确信号，不是「你……吗」启发式
+  assert.equal(group([], '你吃饭了吗'), false);
+});
+
+await test('a random wake tells her that nobody calling her is normal', async ({ h }) => {
+  assert.match(h.buildWakePromptV2(KEY, 'probability@seq1'), /随机叫醒你看看群/);
+  assert.match(h.buildWakePromptV2(KEY, 'probability'), /随机叫醒你看看群/);
+  const at = h.buildWakePromptV2(KEY, 'atMention@seq1');
+  assert.doesNotMatch(at, /随机叫醒/);
+  assert.match(at, /没人叫你也可以插话/);
+});
+
+await test('a message addressed to her after the observation still blocks the close', async ({ st, request, append }) => {
+  append('message before wait');
+  await request('unread');
+  const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 } });
+  const timer = setTimeout(() => append('chatter during observation', { directed: false }), 60);
+  let waited;
+  try { waited = await waiting; } finally { clearTimeout(timer); }
+  assert.equal(waited.data.preSleepWaitObserved, true);
+  append('@her are you still there', { directed: true });
+  const before = plain(st.wakeConfig);
+  const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
+  assert.equal(close.status, 400);
+  assert.deepEqual(plain(st.wakeConfig), before);
+  assert.equal(st.preSleepWaitObservedAt, 0);
 }, { observe: true });
 
 await test('another conversation token, pause, mode and allowlist guards still reject combined close', async ({ h, st, request, append }) => {

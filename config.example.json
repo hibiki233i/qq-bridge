@@ -171,7 +171,7 @@
       "sleepMaxMs": 0,
       "recommendedSleepMinMs": 300000,
       "recommendedSleepMaxMs": 7200000,
-      "recommendedProbability": 0.05,
+      "recommendedProbability": 0.25,
       "recommendedKeywords": [
         "小鲸鱼",
         "DeepSeek",
@@ -194,7 +194,7 @@
       "recommendedNameMention": true,
       "recommendedQuestion": true,
       "recommendedPoke": true,
-      "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
+      "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.25；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
       "batchWindowMs": 8000,
       "maxWakePerMinute": 1,
       "maxWakePerHour": 12,

@@ -803,13 +803,13 @@ function loadConfig() {
         sleepMaxMs: 0,
         recommendedSleepMinMs: 300000,
         recommendedSleepMaxMs: 7200000,
-        recommendedProbability: 0.05,
+        recommendedProbability: 0.25,
         recommendedKeywords: ['小鲸鱼', 'DeepSeek', 'deepseek', 'DS', 'D老师', 'd老师', 'D指导', 'd指导', 'D师傅', 'd师傅', '深度求索', '大肥鱼', '鲸鱼', 'DeepSeek V3', 'DeepSeek R1', 'R1'],
         recommendedAtMention: true,
         recommendedNameMention: true,
         recommendedQuestion: true,
         recommendedPoke: true,
-        recommendedHint: '如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。',
+        recommendedHint: '如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.25；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。',
         batchWindowMs: 8000,
         maxWakePerMinute: 1,
         maxWakePerHour: 12,
@@ -9156,10 +9156,15 @@ async function main() {
     const now = Date.now();
     // 已经连续安静满观察窗口：可以直接设置潜水。
     if ((st.lastIncomingAt || 0) && now - st.lastIncomingAt >= waitMs) return false;
-    // 已经完整等过观察窗口且之后没有新消息：放行。
-    if (st.preSleepWaitSatisfiedAt && (!st.lastIncomingAt || st.lastIncomingAt <= st.preSleepWaitSatisfiedAt)) return false;
-    // 已经做过一次沉睡前观察（可能等到了新消息并已把新消息返回给 AI），只要 AI 之后没有参与、也没有更新的消息，就允许直接沉睡。
-    if (st.preSleepWaitObservedAt && (!st.lastIncomingAt || st.lastIncomingAt <= st.preSleepWaitObservedAt)) return false;
+    // 下面两条只看「冲她来的」新消息（私聊、@她、引用她、叫她昵称、拍她）。
+    // 以前看的是任何新消息：热闹的群里，等待返回到她发出收尾之间几乎总有人说话，
+    // 闸门就变成拼手速——DeepSeek 2 秒内收尾能过，Haiku 走网关 5~20 秒就一直被拒、绕不出来。
+    // 不冲她来的闲聊不该把她留在原地；冲她来的消息仍然拦住，避免话说到一半就睡。
+    const lastDirected = st.lastDirectedIncomingAt || 0;
+    // 已经完整等过观察窗口且之后没有冲她来的新消息：放行。
+    if (st.preSleepWaitSatisfiedAt && lastDirected <= st.preSleepWaitSatisfiedAt) return false;
+    // 已经做过一次沉睡前观察（可能等到了新消息并已把新消息返回给 AI），只要 AI 之后没有参与、也没有冲她来的新消息，就允许直接沉睡。
+    if (st.preSleepWaitObservedAt && lastDirected <= st.preSleepWaitObservedAt) return false;
     return true;
   }
 
@@ -9231,6 +9236,7 @@ async function main() {
         proactiveTimer: null,
         rateLimitRetryTimer: null,
         lastIncomingAt: 0,
+        lastDirectedIncomingAt: 0,
         preSleepWaitSatisfiedAt: 0,
         preSleepWaitObservedAt: 0,
         preSleepWaitAccumMs: 0,
@@ -9302,6 +9308,8 @@ async function main() {
             replyCheckTimer: null,
             proactiveTimer: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
+            // 旧状态文件没有这个字段：按「最后一条消息就是冲她来的」处理，只会更保守。
+            lastDirectedIncomingAt: Number(val.lastDirectedIncomingAt ?? val.lastIncomingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
@@ -9404,6 +9412,7 @@ async function main() {
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
+          lastDirectedIncomingAt: st.lastDirectedIncomingAt || 0,
           preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
           preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
@@ -10627,7 +10636,8 @@ async function main() {
   }
 
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
-  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
+  // directedAtSelf：这条消息是不是冲她来的（见 isDirectedAtSelfV2）。默认 true = 旧行为，任何新消息都作废已完成的沉睡前观察。
+  function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = [], directedAtSelf = true) {
     const st = getSocialV2State(key);
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const unreadLimit = Number(cfg.socialV2?.context?.unreadLimit) || 30;
@@ -10690,9 +10700,13 @@ async function main() {
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
-    st.preSleepWaitSatisfiedAt = 0; // 有新消息进来，之前的“沉睡前已等待/已观察”作废
-    st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    if (directedAtSelf) {
+      // 冲她来的新消息进来，之前的“沉睡前已等待/已观察”作废
+      st.lastDirectedIncomingAt = st.lastIncomingAt;
+      st.preSleepWaitSatisfiedAt = 0;
+      st.preSleepWaitObservedAt = 0;
+    }
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
@@ -10739,9 +10753,12 @@ async function main() {
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
-    st.preSleepWaitSatisfiedAt = 0;
-    st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    if (targetIsSelf || !groupId) {
+      st.lastDirectedIncomingAt = st.lastIncomingAt;
+      st.preSleepWaitSatisfiedAt = 0;
+      st.preSleepWaitObservedAt = 0;
+    }
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
@@ -10875,6 +10892,17 @@ async function main() {
     try { text = JSON.stringify(safe); } catch { text = String(safe); }
     if (text.length > 2000) text = truncateText(text, 2000) + '…(truncated)';
     return text;
+  }
+
+  // 这条消息是不是冲她来的：私聊、@她、引用她的消息、叫她昵称。只认明确信号，
+  // 不用 isDirectedAtAi 那套「你……吗」的启发式——群友之间互相提问也会命中，热闹的群里闸门又会被拦死。
+  // 收尾后被提问照样会按唤醒条件叫醒她，这里宽一点不会漏回。
+  function isDirectedAtSelfV2(event, kind, plainContent, quoteTargetIsSelf) {
+    if (kind === 'private') return true;
+    if (quoteTargetIsSelf) return true;
+    if (Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''))) return true;
+    const name = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
+    return !!name && String(plainContent ?? '').toLowerCase().includes(name.toLowerCase());
   }
 
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
@@ -11245,7 +11273,7 @@ async function main() {
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n先看看群里在聊什么、有没有人找你、对方说完没有、你有没有真想说的，再决定发言、等待还是潜水；群聊正热但没人叫你时，可以插一句有趣的，别一上来就划走。决定潜水前按上面的【沉睡前观察】先等够观察窗口。`;
+    return `${base}【唤醒】${key}\n原因：${reason}${triggeredLine}\n先看看群里在聊什么、有没有人找你、对方说完没有，再决定发言、等待还是潜水。${/^probability\b/.test(String(reason)) ? '这次是随机叫醒你看看群，没人点名很正常——' : ''}没人叫你也可以插话：有一点想法、能吐槽或接梗就说一句，别一上来就划走。决定潜水前按上面的【沉睡前观察】先等够观察窗口。`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -11863,7 +11891,7 @@ async function main() {
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
-      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []), isDirectedAtSelfV2(event, kind, plainContent, quoteTargetIsSelf));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {

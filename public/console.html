@@ -2098,7 +2098,7 @@ button:active:not(:disabled) {
         <label style="flex:1">推荐拍一拍唤醒</label><input type="checkbox" id="v2RecPoke" style="width:auto">
       </div>
       <label>唤醒推荐提示（给 AI 看的文字）</label>
-      <textarea id="v2WakeHint" rows="2" placeholder="例如：如果你在潜水，推荐 5~120 分钟、普通消息概率 0.05…"></textarea>
+      <textarea id="v2WakeHint" rows="2" placeholder="例如：如果你在潜水，推荐 5~120 分钟、普通消息概率 0.25…"></textarea>
 
       </div></details>
 <details class="settings-group"><summary>唤醒硬限制</summary><div class="settings-content">
@@ -3278,7 +3278,7 @@ async function loadV2Config() {
     document.getElementById('v2RecDefaultInfinite').checked = w.recommendedDefaultInfinite !== false;
     document.getElementById('v2RecSleepMin').value = Math.round((w.recommendedSleepMinMs || 300000) / 60000);
     document.getElementById('v2RecSleepMax').value = Math.round((w.recommendedSleepMaxMs || 7200000) / 60000);
-    document.getElementById('v2RecProb').value = w.recommendedProbability ?? 0.05;
+    document.getElementById('v2RecProb').value = w.recommendedProbability ?? 0.25;
     document.getElementById('v2RecKeywords').value = (w.recommendedKeywords || []).join(', ');
     document.getElementById('v2RecAt').checked = w.recommendedAtMention !== false;
     document.getElementById('v2RecName').checked = w.recommendedNameMention !== false;
