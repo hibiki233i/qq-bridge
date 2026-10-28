@@ -150,7 +150,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, appendSocialV2Poke, recordSentMessagesV2,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, scheduleWakeV2, socialV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,

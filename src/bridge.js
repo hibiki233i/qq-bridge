@@ -10790,18 +10790,27 @@ async function main() {
   // 她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。只记她真正回的人：
   // 热闹的群里把最近几条的发言人都算上，闸门又会被闲聊拦住。
   // 取舍：不引用也不 @ 时只记最新一条的发言人；热闹群里她思考期间最新一条可能已经是别人，会记错。
+  function isSelfUserIdV2(uid) {
+    const id = String(uid ?? '').trim();
+    if (!id) return false;
+    if (selfUserId && id === String(selfUserId)) return true;
+    return tg.me?.id != null && id === String(tgConvId(tg.me.id));
+  }
+
   function noteEngagedUsersV2(st, { replyToMessageId = null, atUserId = null, quotedUserId = null } = {}, now = Date.now()) {
     if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
     const windowMs = Math.max(60000, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const targets = [];
-    if (quotedUserId != null && String(quotedUserId).trim() !== '') targets.push(String(quotedUserId).trim());
-    else if (replyToMessageId != null && String(replyToMessageId).trim() !== '') {
+    // 她引用的是自己的消息：等于没引用别人，按「接最新一条」处理。
+    const quotedSelf = quotedUserId != null && isSelfUserIdV2(quotedUserId);
+    if (quotedUserId != null && String(quotedUserId).trim() !== '' && !quotedSelf) targets.push(String(quotedUserId).trim());
+    else if (!quotedSelf && replyToMessageId != null && String(replyToMessageId).trim() !== '') {
       const quoted = st.recentMessages.find((m) => m && !m.isSelf && m.messageId != null && String(m.messageId) === String(replyToMessageId));
       if (quoted?.userId) targets.push(String(quoted.userId));
     }
-    if (atUserId != null && String(atUserId).trim() !== '') targets.push(String(atUserId).trim());
-    // 引用了但找不到发言人（已滚出 recentMessages、解析也没给 userId）时不瞎猜成最新一条的发言人。
-    const quotedSomething = replyToMessageId != null && String(replyToMessageId).trim() !== '';
+    if (atUserId != null && String(atUserId).trim() !== '' && !isSelfUserIdV2(atUserId)) targets.push(String(atUserId).trim());
+    // 引用了别人但找不到发言人（已滚出 recentMessages、解析也没给 userId）时不瞎猜成最新一条的发言人。
+    const quotedSomething = !quotedSelf && replyToMessageId != null && String(replyToMessageId).trim() !== '';
     if (!targets.length && !quotedSomething) {
       const latest = [...st.recentMessages].reverse().find((m) => m && !m.isSelf && m.userId);
       if (latest && now - (Number(latest.time) || 0) < windowMs) targets.push(String(latest.userId));
@@ -11407,33 +11416,21 @@ async function main() {
       }
       // 每次只等一小段（最长 60s）：小时级限频不会一次性睡满一小时而错过中途可用的窗口。
       const waitMs = Math.min(60000, Math.max(1000, Math.round(retryAfterMs) || 5000));
-      // 已有重试在排队时，只在新原因更重要时替换它（例如排着一个关键词唤醒，又有人 @ 她）。
-      if (!st.rateLimitRetryTimer || wakePriorityV2(reason) > wakePriorityV2(st.rateLimitRetryReason)) {
-        st.rateLimitRetryReason = reason;
-      }
-      // 排过定时器类原因（到点唤醒等）就记下来：升级成消息类原因后，未读清空也不能跳过这次重试，
-      // 否则 sleepTimer 已清空、到点唤醒就丢了。
-      if (isTimerWakeReason(reason)) st.rateLimitRetryHasTimerReason = true;
-      if (!st.rateLimitRetryTimer) {
-        st.rateLimitRetryTimer = setTimeout(() => {
-          st.rateLimitRetryTimer = null;
-          const retryReason = st.rateLimitRetryReason || reason;
-          // 标记不在这里清：仍超额会再排一跳，标记要跟着走，直到真唤醒或 set_wake_config 才清。
-          const hadTimerReason = !!st.rateLimitRetryHasTimerReason;
-          st.rateLimitRetryReason = null;
-          // 消息类原因在重试前再确认一次：等待窗口里消息可能已被别的回合处理掉，
-          // 没必要为一条已经处理过的消息再唤醒一次（定时器类原因与未读无关，不检查）。
-          if (!hadTimerReason && !isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
-            log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${retryReason}）`);
-            return;
-          }
-          void sendWakePromptV2(key, retryReason).catch((error) => log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error));
-        }, waitMs);
-        st.rateLimitRetryTimer.unref?.();
-      }
+      queueRateLimitRetryV2(key, st, reason, waitMs);
       log(`[reserved2] 唤醒频率超限，${Math.round(waitMs / 1000)}s 后重试 ${key}（${st.rateLimitRetryReason}）`);
       return;
     }
+    // 真要唤醒了：排队中的限频重试先停下（她醒着会自己看消息、重新定唤醒配置）。
+    // 必须在 await deliverPrompt 之前停：投递要时间，重试若在这期间到点，会被判忙塞进 pendingWakeReasons，
+    // 回合结束后再按过期原因补一次唤醒。投递失败时用 restoreRetry 原样挂回去。
+    const stashedRetry = st.rateLimitRetryTimer
+      ? { reason: st.rateLimitRetryReason, hasTimerReason: !!st.rateLimitRetryHasTimerReason }
+      : null;
+    clearRateLimitRetryV2(st);
+    const restoreRetry = () => {
+      // 60 秒：DSH 一直投递失败时别变成每几秒重试一次。
+      if (stashedRetry?.reason) queueRateLimitRetryV2(key, st, stashedRetry.reason, 60000, { hasTimerReason: stashedRetry.hasTimerReason });
+    };
     // Only a real new wake resets observation; skipped/busy candidates must
     // preserve the current turn's progress through its required wait window.
     st.preSleepWaitSatisfiedAt = 0;
@@ -11489,16 +11486,14 @@ async function main() {
         disarmPendingWakeLease(key);
         rollbackWakeTime();
         restoreFiniteSleep();
+        restoreRetry();
         log(`[reserved2] 唤醒投递被拒 ${key}: ${result.error || '未知错误'}`);
       } else if (result && result.queued === true) {
         // 入队而非真正在途：保留 pendingWakeKeys，等 DSH 恢复后真正投递的 turn/end 再触发收尾保护；
         // 不能在这里删除，否则补投的唤醒回合会丢失“未设置唤醒配置”的安全兜底。
         log(`[reserved2] 唤醒已入队 ${key}（${reason}），等待 DSH 恢复后补投`);
       }
-      // 投递成功（或已入队）才算真唤醒：排队中的限频重试就没用了（她醒着会自己看消息、重新定唤醒配置）。
-      // 不清的话，分类限频后点名类能绕过排着的「其他」类重试，过期的重试之后还会再叫醒她一次。
-      // 投递失败时留着，失败的这次唤醒不能把排着的回复检查/到点唤醒一起带走。
-      if (!(result && result.ok === false)) clearRateLimitRetryV2(st);
+
     } catch (error) {
       pendingWakeKeys.delete(key);
       disarmPendingWakeLease(key);
@@ -11509,6 +11504,7 @@ async function main() {
         saveSocialV2State();
         setupSleepTimerV2(key);
       }
+      restoreRetry();
       log(`[reserved2] 唤醒投递失败 ${key}: ${error?.message ?? error}`);
     }
   }
@@ -11584,11 +11580,15 @@ async function main() {
     question: 80,
     speaker: 75,
     nameMention: 70,
+    poke: 65,
     keyword: 60,
     anyMessage: 50,
+    admin: 45,
     replyCheck: 40,
     timeout: 30,
-    proactiveCheck: 20
+    proactiveCheck: 20,
+    // 随机唤醒最低：合并窗口里先来随机、再来拍一拍等，要按后者报（提示语和限频类别都跟着原因走）。
+    probability: 10
   };
 
   function clearRateLimitRetryV2(st) {
@@ -11596,6 +11596,48 @@ async function main() {
     st.rateLimitRetryTimer = null;
     st.rateLimitRetryReason = null;
     st.rateLimitRetryHasTimerReason = false;
+  }
+
+  // 排一个限频重试。已有重试在排队时，只在新原因更重要时替换它（例如排着一个关键词唤醒，又有人 @ 她）；
+  // 引导唤醒不被替换（初始提示词只随 bootstrap 注入）。hasTimerReason：这一串重试里排过定时器类原因。
+  function queueRateLimitRetryV2(key, st, reason, waitMs, { hasTimerReason = false } = {}) {
+    if (!st.rateLimitRetryTimer || shouldReplaceWakeReasonV2(st.rateLimitRetryReason, reason)) {
+      st.rateLimitRetryReason = reason;
+    }
+    // 排过定时器类原因（到点唤醒等）就记下来：升级成消息类原因后，未读清空也不能跳过这次重试，
+    // 否则 sleepTimer 已清空、到点唤醒就丢了。
+    if (hasTimerReason || isTimerWakeReason(reason)) st.rateLimitRetryHasTimerReason = true;
+    if (st.rateLimitRetryTimer) return;
+    st.rateLimitRetryTimer = setTimeout(() => {
+      st.rateLimitRetryTimer = null;
+      const retryReason = st.rateLimitRetryReason || reason;
+      // 标记先不清：仍超额会再排一跳，标记要跟着走。
+      const hadTimerReason = !!st.rateLimitRetryHasTimerReason;
+      st.rateLimitRetryReason = null;
+      // 消息类原因在重试前再确认一次：等待窗口里消息可能已被别的回合处理掉，
+      // 没必要为一条已经处理过的消息再唤醒一次（定时器类原因与未读无关，不检查）。
+      if (!hadTimerReason && !isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
+        log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${retryReason}）`);
+        return;
+      }
+      void (async () => {
+        try {
+          await sendWakePromptV2(key, retryReason);
+        } catch (error) {
+          log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error);
+        }
+        // 这一跳既没真唤醒、也没再排下一跳（比如会话正忙被暂存、已暂停）：这串重试到此结束，标记清掉，
+        // 免得后面不相干的消息类重试继承它、在未读已清空时还去唤醒。
+        if (!st.rateLimitRetryTimer) st.rateLimitRetryHasTimerReason = false;
+      })();
+    }, waitMs);
+    st.rateLimitRetryTimer.unref?.();
+  }
+
+  // 合并窗口 / 限频重试里，新原因要不要替换排着的原因。
+  function shouldReplaceWakeReasonV2(current, next) {
+    if (current === 'bootstrap') return false; // 初始提示词只随 bootstrap 注入，升级掉就再也补不回来
+    return wakePriorityV2(next) > wakePriorityV2(current);
   }
 
   // 这次唤醒按限频该不该放行（分类见 wakeClassV2，用法见 sendWakePromptV2）。
@@ -11665,7 +11707,7 @@ async function main() {
     if (st.pendingWakeTimer) {
       // 合并窗口内已有待发送唤醒：按优先级升级最终原因，避免先概率后 @ 却仍按概率唤醒。
       const cur = st.pendingWakeReason || reason;
-      if (wakePriorityV2(reason) > wakePriorityV2(cur)) {
+      if (shouldReplaceWakeReasonV2(cur, reason)) {
         st.pendingWakeReason = reason;
         log(`[reserved2] 合并窗口内升级唤醒原因 ${key}: ${cur} -> ${reason}`);
       }

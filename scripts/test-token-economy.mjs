@@ -726,6 +726,74 @@ await test('the person she quoted counts as talking to her, not just whoever spo
   assert.ok(st.lastDirectedIncomingAt > 0);
 });
 
+await test('a queued retry does not fire into the busy queue while a wake is being delivered', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  st.wakeTimes = [Date.now() - 3600000 + 1000]; // 「其他」类约 1.5 秒后腾出额度
+  await h.sendWakePromptV2(KEY, 'timeout');
+  assert.ok(st.rateLimitRetryTimer, 'fixture: timeout queued');
+  const slow = h.api.sessions.prompt;
+  h.api.sessions.prompt = async (params) => { await new Promise((resolve) => setTimeout(resolve, 2500)); return slow(params); };
+  append('@her');
+  await h.sendWakePromptV2(KEY, 'atMention'); // 点名类不受小时上限，立即投递（慢）
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(st.rateLimitRetryTimer, null);
+  assert.deepEqual(st.pendingWakeReasons || [], [], 'the superseded timeout must not be replayed after this turn');
+});
+
+await test('a retry hop that ends without waking her drops the timer flag', async ({ h, st }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  st.wakeTimes = [Date.now() - 3600000 + 1000];
+  await h.sendWakePromptV2(KEY, 'timeout');
+  assert.equal(st.rateLimitRetryHasTimerReason, true);
+  h.promptQueues.set(KEY, { running: true, queue: [] }); // 到点时会话正忙：被暂存，不是真唤醒
+  for (let i = 0; i < 40 && st.rateLimitRetryHasTimerReason; i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  h.promptQueues.delete(KEY);
+  assert.equal(st.rateLimitRetryTimer, null);
+  assert.equal(st.rateLimitRetryHasTimerReason, false, 'a later message retry must not inherit the flag');
+});
+
+await test('set_wake_config clears the timer flag of an upgraded message retry', async ({ h, st, request, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1 });
+  st.wakeTimes = minutesAgo(10);
+  append('keyword message');
+  await h.sendWakePromptV2(KEY, 'timeout');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.equal(st.rateLimitRetryHasTimerReason, true);
+  assert.equal((await request('wake-config', { body: { config: ACTIVE } })).status, 200);
+  assert.ok(st.rateLimitRetryTimer, 'the message retry stays');
+  assert.equal(st.rateLimitRetryHasTimerReason, false, 'the new config supersedes the timeout part');
+  stopRetry(st);
+});
+
+await test('wake merging: name beats speaker, poke beats random, bootstrap is never replaced', async ({ h, st }) => {
+  h.scheduleWakeV2(KEY, 'speaker:u123');
+  h.scheduleWakeV2(KEY, 'nameMention');
+  assert.equal(st.pendingWakeReason, 'nameMention', 'calling her by name outranks a watched speaker');
+  clearTimeout(st.pendingWakeTimer); st.pendingWakeTimer = null; st.pendingWakeReason = null;
+  h.scheduleWakeV2(KEY, 'probability');
+  h.scheduleWakeV2(KEY, 'poke');
+  assert.equal(st.pendingWakeReason, 'poke');
+  clearTimeout(st.pendingWakeTimer); st.pendingWakeTimer = null; st.pendingWakeReason = null;
+  h.scheduleWakeV2(KEY, 'bootstrap');
+  h.scheduleWakeV2(KEY, 'atMention');
+  assert.equal(st.pendingWakeReason, 'bootstrap', 'the initial prompt only rides on bootstrap');
+  clearTimeout(st.pendingWakeTimer); st.pendingWakeTimer = null;
+});
+
+await test('who she is talking to: resolved quote wins, unknown quote is not guessed, self-quote falls back', async ({ h, st }) => {
+  h.setSelfIdentity('🐳', '999');
+  const msg = (id, uid) => h.appendSocialV2Message(KEY, 'x', 't', 't', false, false, id, [], uid, [], false);
+  const engaged = () => [...(st.engagedUsers?.keys() || [])].sort();
+  msg('m1', '111'); msg('m2', '222');
+  h.recordSentMessagesV2(KEY, ['a'], { replyToMessageId: 'm1', quotedUserId: '333' });
+  assert.deepEqual(engaged(), ['333'], 'the resolved quote target wins over the local lookup');
+  st.engagedUsers.clear();
+  h.recordSentMessagesV2(KEY, ['b'], { replyToMessageId: 'scrolled-away' });
+  assert.deepEqual(engaged(), [], 'an unknown quote target is not guessed as the latest speaker');
+  h.recordSentMessagesV2(KEY, ['c'], { replyToMessageId: 'my-own', quotedUserId: '999' });
+  assert.deepEqual(engaged(), ['222'], 'quoting herself counts as replying to the latest message');
+});
+
 await test('offline wake replay builds a fresh snapshot with the current session token', async ({ h, st, request, append }) => {
   await h.ensureSession(KEY);
   const originalToken = st.agentToken;
