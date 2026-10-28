@@ -13,7 +13,9 @@ const prefix = persona?.config?.prefix ?? '';
 
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
-  assert.match(prefix, /\{\{model\}\}/);
+  // 人设只说她是鲸鱼娘：不写「coding agent」开头，也不点名任何模型/厂商（后台模型可换）。
+  assert.match(prefix, /^你是鲸鱼娘/);
+  assert.doesNotMatch(prefix, /coding agent|deepseek|深度求索|claude|anthropic|\bgpt/i);
   // DSH 0.2.1 起 agent loop 只注册 provider / model 两个提示词变量（0.2.0 还有 cwd），
   // 未知变量会让 system prompt 装配直接抛错 ⇒ 每回合 error、模型一次都不跑。
   // 这里钉住「只用已注册变量」，而不只是「有 {{model}}」。

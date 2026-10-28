@@ -45,7 +45,7 @@ test('一代与二代的硬性不变量清单确实不同（防止又合并成�
 test('真实预设能定位到 persona 的 prefix 块', () => {
   const loc = locatePresetPromptBlock(source);
   assert.ok(loc, '应能定位 prefix 块');
-  assert.equal(loc.lines[loc.keyLine].trim(), 'prefix: >-');
+  assert.match(loc.lines[loc.keyLine].trim(), /^prefix: [>|]-$/);
   assert.ok(loc.blockEnd > loc.keyLine + 1, 'prefix 块应包含内容行');
   assert.ok(loc.entryEnd > loc.blockEnd, 'persona 条目应在 prefix 块之后还有内容');
 });
@@ -56,7 +56,6 @@ test('抽出的是 YAML 解析后的真实字符串（折叠标量已展开）',
   for (const marker of PRESET_REQUIRED_MARKERS) {
     assert.ok(originalPrefix.includes(marker), `内置提示词应包含安全基线段落：${marker}`);
   }
-  assert.ok(originalPrefix.includes('{{model}}'), '应保留模板变量');
 });
 
 test('原样写回是幂等的，且不改变提示词语义', () => {
@@ -152,13 +151,13 @@ test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
 
 test('只含空格/Tab 的行也能安全往返（不会被当成空行读丢）', () => {
   const spaced = [
-    ...originalPrefix.split('\n').slice(0, 3),
+    ...originalPrefix.split('\n'),
     '   ',
     '\t',
     ' 带前后空格的正文 ',
     '正常一行',
   ].join('\n');
-  // 前 3 行来自原文，因此安全不变量仍然齐全
+  // 原文整段保留，因此安全不变量仍然齐全
   const next = renderPresetPromptYaml(source, spaced);
   assert.equal(extractPresetPrefix(next), spaced, '空白行必须原样保留');
 });
