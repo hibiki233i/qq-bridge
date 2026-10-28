@@ -198,6 +198,7 @@
       "batchWindowMs": 8000,
       "maxWakePerMinute": 1,
       "maxWakePerHour": 12,
+      "maxRandomWakePerHour": 12,
       "noActionLimit": 3,
       "maxWakeConfigReminders": 2
     },

@@ -813,6 +813,7 @@ function loadConfig() {
         batchWindowMs: 8000,
         maxWakePerMinute: 1,
         maxWakePerHour: 12,
+        maxRandomWakePerHour: 12,
         noActionLimit: 3,
         maxWakeConfigReminders: 2
       },
@@ -5127,7 +5128,7 @@ async function main() {
           // wake：数值与字符串数组归一化
           if (body.wake && typeof body.wake === 'object') {
             merged.wake = { ...(current.wake ?? {}), ...body.wake };
-            for (const k of ['sleepMinMs', 'sleepMaxMs', 'recommendedSleepMinMs', 'recommendedSleepMaxMs', 'recommendedProbability', 'batchWindowMs', 'maxWakePerMinute', 'maxWakePerHour', 'noActionLimit', 'maxWakeConfigReminders', 'preSleepWaitMs']) {
+            for (const k of ['sleepMinMs', 'sleepMaxMs', 'recommendedSleepMinMs', 'recommendedSleepMaxMs', 'recommendedProbability', 'batchWindowMs', 'maxWakePerMinute', 'maxWakePerHour', 'maxRandomWakePerHour', 'noActionLimit', 'maxWakeConfigReminders', 'preSleepWaitMs']) {
               if (merged.wake[k] !== undefined) {
                 const n = Number(merged.wake[k]);
                 merged.wake[k] = Number.isFinite(n) ? n : current.wake?.[k] ?? 0;
@@ -9228,6 +9229,8 @@ async function main() {
         agentToken: crypto.randomBytes(16).toString('hex'),
         bootstrapSent: false,
         wakeTimes: [],
+        randomWakeTimes: [],
+        directedWakeTimes: [],
         sendTimes: [],
         stickerCollectTimes: [],
         pendingWakeTimer: null,
@@ -9301,6 +9304,8 @@ async function main() {
             agentToken,
             bootstrapSent: !!val.bootstrapSent,
             wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
+            randomWakeTimes: Array.isArray(val.randomWakeTimes) ? val.randomWakeTimes : [],
+            directedWakeTimes: Array.isArray(val.directedWakeTimes) ? val.directedWakeTimes : [],
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
             pendingWakeTimer: null,
@@ -9409,6 +9414,8 @@ async function main() {
           agentToken: st.agentToken,
           bootstrapSent: st.bootstrapSent,
           wakeTimes: st.wakeTimes.slice(-200),
+          randomWakeTimes: (st.randomWakeTimes || []).slice(-200),
+          directedWakeTimes: (st.directedWakeTimes || []).slice(-200),
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
@@ -11308,43 +11315,63 @@ async function main() {
       log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}）`);
       return;
     }
-    // 唤醒频率硬限制：超限则**延后重试**，不能直接丢弃。直接 return 的后果：
+    // 唤醒频率硬限制，按唤醒类别分开算：
+    //   · 点名类（私聊/@或引用她/叫名字/提问）：只受每分钟上限，不受每小时上限——
+    //     以前它们和随机唤醒共用每小时 12 次，概率调高后随机唤醒先把额度用完，有人找她要排队到一小时；
+    //   · 随机唤醒（probability）：单独每小时 maxRandomWakePerHour 次，超限（含每分钟上限）直接放弃，不重试；
+    //   · 其他（关键词、指定成员、拍一拍、定时到点、回复检查、主动机会……）：每小时 maxWakePerHour 次，只数这一类。
+    // 点名类与其他类超限时**延后重试**，不能直接丢弃。直接 return 的后果：
     //   · timeout 唤醒时 setupSleepTimerV2 已经清空 sleepTimer，丢弃后这个会话会停在
     //     「infinite=false、sleepUntil 已过期、没有任何定时器」的静默态，除非重启或
     //     主动机会兜底（默认 30~90 分钟）才可能恢复；
     //   · @/提问被丢弃则要等下一条消息才可能再唤醒。
     // 重试仍然遵守限频（等到窗口腾出位置），只是把「这一枪」补回来。
     const now = Date.now();
+    const wakeClass = wakeClassV2(reason);
     const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
-    const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
-    const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
-    const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-    if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
+    const maxPerHour = wakeClass === 'random'
+      ? Number(cfg.socialV2?.wake?.maxRandomWakePerHour ?? 12) || 0
+      : wakeClass === 'other' ? Number(cfg.socialV2?.wake?.maxWakePerHour) || 0 : 0;
+    const minuteTimes = (st.wakeTimes || []).filter((t) => now - t < 60000);
+    const hourTimes = wakeTimesInClassV2(st, wakeClass).filter((t) => now - t < 3600000);
+    const minuteFull = maxPerMinute > 0 && minuteTimes.length >= maxPerMinute;
+    const hourFull = maxPerHour > 0 && hourTimes.length >= maxPerHour;
+    if (minuteFull || hourFull) {
+      if (wakeClass === 'random') {
+        log(`[reserved2] 随机唤醒超出${hourFull ? '每小时' : '每分钟'}上限，本次放弃 ${key}（${reason}）`);
+        return;
+      }
       let retryAfterMs = 0;
-      if (maxPerMinute > 0 && recentMinute >= maxPerMinute) {
-        const times = (st.wakeTimes || []).filter((t) => now - t < 60000).sort((a, b) => a - b);
+      if (minuteFull) {
+        const times = [...minuteTimes].sort((a, b) => a - b);
         if (times.length) retryAfterMs = Math.max(retryAfterMs, 60000 - (now - times[0]) + 500);
       }
-      if (maxPerHour > 0 && recentHour >= maxPerHour) {
-        const times = (st.wakeTimes || []).filter((t) => now - t < 3600000).sort((a, b) => a - b);
+      if (hourFull) {
+        const times = [...hourTimes].sort((a, b) => a - b);
         if (times.length) retryAfterMs = Math.max(retryAfterMs, 3600000 - (now - times[0]) + 500);
       }
       // 每次只等一小段（最长 60s）：小时级限频不会一次性睡满一小时而错过中途可用的窗口。
       const waitMs = Math.min(60000, Math.max(1000, Math.round(retryAfterMs) || 5000));
+      // 已有重试在排队时，只在新原因更重要时替换它（例如排着一个关键词唤醒，又有人 @ 她）。
+      if (!st.rateLimitRetryTimer || wakePriorityV2(reason) > wakePriorityV2(st.rateLimitRetryReason)) {
+        st.rateLimitRetryReason = reason;
+      }
       if (!st.rateLimitRetryTimer) {
         st.rateLimitRetryTimer = setTimeout(() => {
           st.rateLimitRetryTimer = null;
+          const retryReason = st.rateLimitRetryReason || reason;
+          st.rateLimitRetryReason = null;
           // 消息类原因在重试前再确认一次：等待窗口里消息可能已被别的回合处理掉，
           // 没必要为一条已经处理过的消息再唤醒一次（定时器类原因与未读无关，不检查）。
-          if (!isTimerWakeReason(reason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
-            log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${reason}）`);
+          if (!isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
+            log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${retryReason}）`);
             return;
           }
-          void sendWakePromptV2(key, reason).catch((error) => log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error));
+          void sendWakePromptV2(key, retryReason).catch((error) => log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error));
         }, waitMs);
         st.rateLimitRetryTimer.unref?.();
       }
-      log(`[reserved2] 唤醒频率超限，${Math.round(waitMs / 1000)}s 后重试 ${key}（${reason}）`);
+      log(`[reserved2] 唤醒频率超限，${Math.round(waitMs / 1000)}s 后重试 ${key}（${st.rateLimitRetryReason}）`);
       return;
     }
     // Only a real new wake resets observation; skipped/busy candidates must
@@ -11356,6 +11383,12 @@ async function main() {
     const wakeTime = now;
     st.wakeTimes.push(wakeTime);
     if (st.wakeTimes.length > 200) st.wakeTimes = st.wakeTimes.slice(-200);
+    const classTimesKey = wakeClass === 'random' ? 'randomWakeTimes' : wakeClass === 'directed' ? 'directedWakeTimes' : null;
+    if (classTimesKey) {
+      if (!Array.isArray(st[classTimesKey])) st[classTimesKey] = [];
+      st[classTimesKey].push(wakeTime);
+      if (st[classTimesKey].length > 200) st[classTimesKey] = st[classTimesKey].slice(-200);
+    }
     // 无论提前唤醒还是超时唤醒，都清理有限潜水定时器与 sleepUntil，避免状态残留/重复唤醒
     const prevSleepUntil = st.wakeConfig.sleepUntil;
     const hadFiniteSleep = !st.wakeConfig.infinite && !!prevSleepUntil && Number.isFinite(Date.parse(prevSleepUntil));
@@ -11373,6 +11406,10 @@ async function main() {
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
+      if (classTimesKey) {
+        const classIdx = st[classTimesKey].lastIndexOf(wakeTime);
+        if (classIdx >= 0) st[classTimesKey].splice(classIdx, 1);
+      }
       saveSocialV2State();
     };
     try {
@@ -11490,9 +11527,30 @@ async function main() {
     proactiveCheck: 20
   };
 
-  // 唤醒原因可能带子类型（如 keyword:小鲸鱼、speaker:昵称），取冒号前的基名计算优先级。
+  // 唤醒限频的类别（见 sendWakePromptV2）。原因可能带子类型或 seq（keyword:小鲸鱼、probability@seq797），取基名。
+  const DIRECTED_WAKE_REASONS = new Set(['private', 'atMention', 'nameMention', 'question']);
+  function wakeClassV2(reason) {
+    const base = String(reason ?? '').split(/[:@]/)[0];
+    if (DIRECTED_WAKE_REASONS.has(base)) return 'directed';
+    if (base === 'probability') return 'random';
+    return 'other';
+  }
+  // 某一类别的唤醒时间。「其他」类没有单独记录：从全部唤醒里按次数扣掉随机类和点名类。
+  function wakeTimesInClassV2(st, wakeClass) {
+    if (wakeClass === 'random') return [...(st.randomWakeTimes || [])];
+    if (wakeClass === 'directed') return [...(st.directedWakeTimes || [])];
+    const remove = new Map();
+    for (const t of [...(st.randomWakeTimes || []), ...(st.directedWakeTimes || [])]) remove.set(t, (remove.get(t) || 0) + 1);
+    return (st.wakeTimes || []).filter((t) => {
+      const n = remove.get(t) || 0;
+      if (n > 0) { remove.set(t, n - 1); return false; }
+      return true;
+    });
+  }
+
+  // 唤醒原因可能带子类型或 seq（如 keyword:小鲸鱼、speaker:昵称、atMention@seq194），取基名计算优先级。
   function wakePriorityV2(reason) {
-    const base = String(reason ?? '').split(':')[0];
+    const base = String(reason ?? '').split(/[:@]/)[0];
     return WAKE_PRIORITY[base] ?? 0;
   }
 
@@ -11696,6 +11754,7 @@ async function main() {
       clearTimeout(st.rateLimitRetryTimer);
       st.rateLimitRetryTimer = null;
     }
+    st.rateLimitRetryReason = null;
     if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
   }
 

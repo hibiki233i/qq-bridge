@@ -2108,8 +2108,12 @@ button:active:not(:disabled) {
       </div>
       <div class="row">
         <label style="flex:1">每分钟最多唤醒</label><input type="number" id="v2MaxWakeMin" min="0" style="width:90px">
-        <label style="flex:1">每小时最多唤醒</label><input type="number" id="v2MaxWakeHour" min="0" style="width:90px">
+        <label style="flex:1">每小时最多唤醒（关键词/定时等）</label><input type="number" id="v2MaxWakeHour" min="0" style="width:90px">
       </div>
+      <div class="row">
+        <label style="flex:1">每小时最多随机唤醒</label><input type="number" id="v2MaxRandomWakeHour" min="0" style="width:90px">
+      </div>
+      <div class="meta">私聊、@、引用、叫名字、提问只受每分钟上限，不占上面两个小时额度；随机唤醒超出上限直接放弃，不排队。</div>
       <div class="row">
         <label style="flex:1">合并窗口（毫秒）</label><input type="number" id="v2BatchWindowMs" min="1000" step="500" style="width:100px">
         <label style="flex:1">无行动兜底次数</label><input type="number" id="v2NoActionLimit" min="1" style="width:80px">
@@ -3289,6 +3293,7 @@ async function loadV2Config() {
     document.getElementById('v2SleepMaxMs').value = Math.round((w.sleepMaxMs || 0) / 1000);
     document.getElementById('v2MaxWakeMin').value = w.maxWakePerMinute ?? 1;
     document.getElementById('v2MaxWakeHour').value = w.maxWakePerHour ?? 12;
+    document.getElementById('v2MaxRandomWakeHour').value = w.maxRandomWakePerHour ?? 12;
     document.getElementById('v2BatchWindowMs').value = w.batchWindowMs ?? 8000;
     document.getElementById('v2NoActionLimit').value = w.noActionLimit ?? 3;
     document.getElementById('v2MaxWakeConfigReminders').value = w.maxWakeConfigReminders ?? 2;
@@ -3370,6 +3375,7 @@ async function saveV2Config() {
       sleepMaxMs: (Math.round(Number(document.getElementById('v2SleepMaxMs').value) || 0)) * 1000,
       maxWakePerMinute: Math.round(Number(document.getElementById('v2MaxWakeMin').value) || 0),
       maxWakePerHour: Math.round(Number(document.getElementById('v2MaxWakeHour').value) || 0),
+      maxRandomWakePerHour: Math.round(Number(document.getElementById('v2MaxRandomWakeHour').value) || 0),
       batchWindowMs: Math.round(Number(document.getElementById('v2BatchWindowMs').value) || 8000),
       noActionLimit: Math.round(Number(document.getElementById('v2NoActionLimit').value) || 3),
       maxWakeConfigReminders: Math.round(Number(document.getElementById('v2MaxWakeConfigReminders').value) || 2)

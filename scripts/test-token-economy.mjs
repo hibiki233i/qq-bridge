@@ -503,6 +503,64 @@ await test('a retired prompt session cannot grant a receipt when its old accepta
   assert.deepEqual(seqs(st.unread), [1]);
 });
 
+// 唤醒限频按类别分开：点名类不受每小时上限；随机唤醒单独限额、超限直接放弃；其他类只数自己。
+const minutesAgo = (...mins) => mins.map((m) => Date.now() - m * 60000);
+const stopRetry = (st) => { clearTimeout(st.rateLimitRetryTimer); st.rateLimitRetryTimer = null; };
+
+await test('random wakes have their own hourly budget and are dropped instead of queued', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 12, maxRandomWakePerHour: 2 });
+  st.wakeTimes = minutesAgo(10, 20);
+  st.randomWakeTimes = [...st.wakeTimes];
+  append('ordinary chatter');
+  await h.sendWakePromptV2(KEY, 'probability');
+  assert.equal(h.calls.prompts.length, 0);
+  assert.equal(st.rateLimitRetryTimer, null, 'a random wake over budget must not be retried');
+});
+
+await test('a wake that addresses her is not held back by the hourly caps', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 2, maxRandomWakePerHour: 2 });
+  st.wakeTimes = minutesAgo(10, 20, 30, 40);
+  st.randomWakeTimes = st.wakeTimes.slice(0, 2);
+  append('@her a question');
+  await h.sendWakePromptV2(KEY, 'atMention@seq1');
+  assert.equal(h.calls.prompts.length, 1);
+  assert.equal(st.directedWakeTimes.length, 1);
+});
+
+await test('other wakes keep their hourly cap and are retried later', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 2, maxRandomWakePerHour: 2 });
+  st.wakeTimes = minutesAgo(10, 20, 30, 40);
+  st.randomWakeTimes = st.wakeTimes.slice(0, 2);
+  append('mentions the keyword');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.equal(h.calls.prompts.length, 0);
+  assert.ok(st.rateLimitRetryTimer, 'an over-budget keyword wake is retried, not dropped');
+  stopRetry(st);
+});
+
+await test('random wakes do not use up the hourly budget of other wakes', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 2, maxRandomWakePerHour: 2 });
+  st.wakeTimes = minutesAgo(10, 20);
+  st.randomWakeTimes = [...st.wakeTimes];
+  append('mentions the keyword');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.equal(h.calls.prompts.length, 1);
+});
+
+await test('a queued retry is upgraded when someone addresses her', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 12, maxRandomWakePerHour: 12 });
+  st.wakeTimes = [Date.now() - 5000];
+  append('mentions the keyword');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.equal(st.rateLimitRetryReason, 'keyword:鲸鱼');
+  await h.sendWakePromptV2(KEY, 'atMention');
+  assert.equal(st.rateLimitRetryReason, 'atMention');
+  await h.sendWakePromptV2(KEY, 'keyword:鲸鱼');
+  assert.equal(st.rateLimitRetryReason, 'atMention', 'a lower-priority reason must not downgrade the retry');
+  assert.equal(h.calls.prompts.length, 0);
+  stopRetry(st);
+});
+
 await test('offline wake replay builds a fresh snapshot with the current session token', async ({ h, st, request, append }) => {
   await h.ensureSession(KEY);
   const originalToken = st.agentToken;
