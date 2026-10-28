@@ -242,7 +242,7 @@ await test('only pokes at her (or in private) count as addressing her', async ({
   assert.ok(st.lastDirectedIncomingAt > 0);
 });
 
-await test('a close without a watermark still treats any new message as blocking', async ({ st, request, append }) => {
+await test('only a mark_read without a watermark treats any new message as blocking', async ({ st, request, append }) => {
   append('message before wait');
   await request('unread');
   const waiting = request('wait', { body: { timeoutMs: 1000, quietMs: 0 } });
@@ -250,12 +250,14 @@ await test('a close without a watermark still treats any new message as blocking
   let waited;
   try { waited = await waiting; } finally { clearTimeout(timer); }
   append('unseen chatter', { directed: false });
-  const legacy = await request('wake-config', { body: { config: DIVING } });
-  assert.equal(legacy.status, 400, 'without throughSeq the close would clear unseen chatter, so the old rule applies');
+  const legacy = await request('mark-read', { body: {} });
+  assert.equal(legacy.status, 400, 'mark_read without throughSeq would clear unseen chatter, so the old rule applies');
   assert.deepEqual(seqs(st.unread), [1, 2, 3]);
-  const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
-  assert.equal(close.status, 200);
-  assert.deepEqual(seqs(st.unread), [3]);
+  // set_wake_config without throughSeq leaves unread alone, so chatter does not block it
+  const configOnly = await request('wake-config', { body: { config: DIVING } });
+  assert.equal(configOnly.status, 200);
+  assert.deepEqual(seqs(st.unread), [1, 2, 3]);
+  assert.ok(waited.data.readThroughSeq >= 2);
 }, { observe: true });
 
 await test('a random wake tells her that nobody calling her is normal', async ({ h }) => {
@@ -608,6 +610,72 @@ await test('a queued retry is upgraded when someone addresses her', async ({ h, 
   assert.equal(st.rateLimitRetryReason, 'atMention', 'a lower-priority reason must not downgrade the retry');
   assert.equal(h.calls.prompts.length, 0);
   stopRetry(st);
+});
+
+await test('a random wake over budget is dropped before it clears the finite-sleep timer', async ({ h, st }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxRandomWakePerHour: 12 });
+  h.setSelfIdentity('🐳', '999');
+  st.wakeConfig = { ...st.wakeConfig, mode: 'diving', infinite: false, sleepUntil: new Date(Date.now() + 30 * 60000).toISOString(),
+    triggers: { probability: 1 } };
+  h.setupSleepTimerV2(KEY);
+  assert.ok(st.sleepTimer, 'fixture: finite sleep is armed');
+  st.wakeTimes = [Date.now() - 5000];
+  st.bootstrapSent = true; // 已引导过：首条消息不走 bootstrap 唤醒
+  await h.handleIncoming('group', '456', { self_id: 999, user_id: 123, message_id: 1, message: [{ type: 'text', data: { text: '随便聊' } }],
+    raw_message: '随便聊', sender: { nickname: '群友', card: '群友' } }, h.cfg);
+  assert.ok(st.sleepTimer, 'the scheduled timeout wake must survive a dropped random wake');
+  assert.equal(st.pendingWakeTimer, null);
+  // 兜底：定时器已被清掉（8 秒合并窗口里额度变满）时，放弃随机唤醒会把它重新挂上
+  clearTimeout(st.sleepTimer); st.sleepTimer = null;
+  await h.sendWakePromptV2(KEY, 'probability');
+  assert.ok(st.sleepTimer);
+  clearTimeout(st.sleepTimer); st.sleepTimer = null;
+});
+
+await test('wakes that call her are classified as directed even when another trigger matches first', async ({ h, st }) => {
+  h.setSelfIdentity('🐳', '999');
+  h.cfg.socialV2.selfNames = ['小鲸鱼'];
+  const ev = (text, extra = []) => ({ self_id: 999, user_id: 1, message: [...extra, { type: 'text', data: { text } }] });
+  st.wakeConfig.triggers = { keywords: ['小鲸鱼', 'DeepSeek'], nameMention: true };
+  assert.equal(h.evaluateWakeTriggerV2(KEY, st, ev('小鲸鱼在吗'), 'group', '小鲸鱼在吗', '小鲸鱼在吗', false), 'nameMention');
+  assert.equal(h.evaluateWakeTriggerV2(KEY, st, ev('DeepSeek 又更新了'), 'group', 'DeepSeek 又更新了', 'DeepSeek 又更新了', false), 'keyword:DeepSeek');
+  st.wakeConfig.triggers = { anyMessage: true };
+  assert.equal(h.evaluateWakeTriggerV2(KEY, st, ev('看', [{ type: 'at', data: { qq: '999' } }]), 'group', '看', '看', false), 'atMention');
+  st.wakeConfig.triggers = { nameMention: true };
+  assert.equal(h.evaluateWakeTriggerV2(KEY, st, ev('🐳'), 'group', '🐳', '🐳', false), null, 'an emoji-only nickname is not her name');
+});
+
+await test('a successful wake cancels a stale queued retry', async ({ h, st, append }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 0, maxWakePerHour: 1, maxRandomWakePerHour: 12 });
+  st.wakeTimes = minutesAgo(10);
+  append('@her');
+  await h.sendWakePromptV2(KEY, 'timeout');
+  assert.ok(st.rateLimitRetryTimer, 'fixture: the timeout wake is queued');
+  await h.sendWakePromptV2(KEY, 'atMention');
+  assert.equal(h.calls.prompts.length, 1);
+  assert.equal(st.rateLimitRetryTimer, null);
+  assert.equal(st.rateLimitRetryReason, null);
+});
+
+await test('upgrading a queued timeout keeps it from being skipped on an empty unread list', async ({ h, st }) => {
+  Object.assign(h.cfg.socialV2.wake, { maxWakePerMinute: 1, maxWakePerHour: 12 });
+  st.wakeTimes = [Date.now() - 5000];
+  await h.sendWakePromptV2(KEY, 'timeout');
+  await h.sendWakePromptV2(KEY, 'atMention');
+  assert.equal(st.rateLimitRetryReason, 'atMention');
+  assert.equal(st.rateLimitRetryHasTimerReason, true);
+  stopRetry(st);
+});
+
+await test('the person she quoted counts as talking to her, not just whoever spoke last', async ({ h, st }) => {
+  h.appendSocialV2Message(KEY, 'a', 'question from A', 'question from A', false, false, 'msg-a', [], '111', [], false);
+  h.appendSocialV2Message(KEY, 'b', 'chatter from B', 'chatter from B', false, false, 'msg-b', [], '222', [], false);
+  h.recordSentMessagesV2(KEY, ['answer to A'], { replyToMessageId: 'msg-a' });
+  st.lastDirectedIncomingAt = 0;
+  h.appendSocialV2Message(KEY, 'b', 'more from B', 'more from B', false, false, 'msg-b2', [], '222', [], false);
+  assert.equal(st.lastDirectedIncomingAt, 0, 'B was not the one she answered');
+  h.appendSocialV2Message(KEY, 'a', 'A follows up', 'A follows up', false, false, 'msg-a2', [], '111', [], false);
+  assert.ok(st.lastDirectedIncomingAt > 0);
 });
 
 await test('offline wake replay builds a fresh snapshot with the current session token', async ({ h, st, request, append }) => {

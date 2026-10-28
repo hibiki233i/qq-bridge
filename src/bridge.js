@@ -5627,7 +5627,8 @@ async function main() {
             }
           }
           // 沉睡前强制观察窗口：除非对方明确结束、或已经安静/等待足够时间，否则不允许 AI 聊两句就设置潜水。
-          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st, { strict: throughSeq === null })) {
+          // 不带 throughSeq 的 set_wake_config 不动未读，所以不用 strict（strict 只给会清空未读的 mark_read）。
+          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st)) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -5659,6 +5660,10 @@ async function main() {
             st.pendingWakeTimer = null;
           }
           cancelReplyCheckV2(key); // AI 已主动设置新的唤醒配置，取消回复检查
+          // 排队的定时器类重试（到点唤醒等）已被新配置取代；消息类重试留着——那条消息她可能还没看到，
+          // 重试前会按未读再确认一次。
+          if (isTimerWakeReason(st.rateLimitRetryReason)) clearRateLimitRetryV2(st);
+          else st.rateLimitRetryHasTimerReason = false;
           setupSleepTimerV2(key);
           log(`[reserved2] 更新唤醒配置 ${key}: mode=${next.mode} infinite=${next.infinite} sleepUntil=${next.sleepUntil ?? 'null'}`);
           sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeConfig: next, wakeSafety: computeWakeSafetyV2(next) });
@@ -6013,7 +6018,7 @@ async function main() {
           }
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -6027,7 +6032,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -7754,7 +7759,7 @@ async function main() {
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, { replyToMessageId: actualReplyToMessageId, atUserId });
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -7765,7 +7770,7 @@ async function main() {
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, { replyToMessageId: actualReplyToMessageId, atUserId });
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -9148,7 +9153,7 @@ async function main() {
     return true; // diving 且不是 anyMessage 都视为“沉睡/潜水”，需要先观察
   }
 
-  // strict：不带 throughSeq 的收尾会清掉全部未读（兼容语义），这时任何新消息都要拦，按旧规则判断。
+  // strict：不带 throughSeq 的 mark_read 会清掉全部未读（兼容语义），这时任何新消息都要拦，按旧规则判断。
   function preSleepWaitBlockedV2(st, { strict = false } = {}) {
     if (!st) return false;
     const w = cfg.socialV2?.wake ?? {};
@@ -10778,8 +10783,8 @@ async function main() {
     return msg;
   }
 
-  const ENGAGED_WINDOW_MS = 10 * 60 * 1000;
-  function recordSentMessagesV2(key, messages) {
+  // replyToMessageId / atUserId：这次发言引用了谁、@ 了谁，用来记「正在和她聊的人」。
+  function recordSentMessagesV2(key, messages, { replyToMessageId = null, atUserId = null } = {}) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
@@ -10798,12 +10803,26 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
-    // 记下正在和她聊的人：发言前最近 3 条别人的消息（10 分钟内）的发言人，之后 10 分钟里他们说的话
-    // 都算冲她来（沉睡前观察闸门用）。她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。
-    if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
-    const recentOthers = st.recentMessages.filter((m) => m && !m.isSelf && m.userId && now - (Number(m.time) || 0) < ENGAGED_WINDOW_MS).slice(-3);
-    for (const m of recentOthers) st.engagedUsers.set(String(m.userId), now + ENGAGED_WINDOW_MS);
-    for (const [uid, until] of st.engagedUsers) if (until <= now) st.engagedUsers.delete(uid);
+    // 记下正在和她聊的人：她这次引用的那条消息的发言人、@ 的人；都没有就是她接的最新一条别人的消息
+    // 的发言人。之后一个观察窗口（默认 5 分钟）里这些人说的话都算冲她来（沉睡前观察闸门用）。
+    // 她接话时多半不 @ 也不引用，对方回她也一样，光看 @/引用会漏。只记她真正回的人：
+    // 热闹的群里把最近几条的发言人都算上，闸门又会被闲聊拦住。
+    if (list.length) {
+      if (!(st.engagedUsers instanceof Map)) st.engagedUsers = new Map();
+      const windowMs = Math.max(60000, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+      const targets = [];
+      if (replyToMessageId != null && String(replyToMessageId).trim() !== '') {
+        const quoted = st.recentMessages.find((m) => m && !m.isSelf && m.messageId != null && String(m.messageId) === String(replyToMessageId));
+        if (quoted?.userId) targets.push(String(quoted.userId));
+      }
+      if (atUserId != null && String(atUserId).trim() !== '') targets.push(String(atUserId).trim());
+      if (!targets.length) {
+        const latest = [...st.recentMessages].reverse().find((m) => m && !m.isSelf && m.userId);
+        if (latest && now - (Number(latest.time) || 0) < windowMs) targets.push(String(latest.userId));
+      }
+      for (const uid of targets) st.engagedUsers.set(uid, now + windowMs);
+      for (const [uid, until] of st.engagedUsers) if (until <= now) st.engagedUsers.delete(uid);
+    }
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -10916,11 +10935,19 @@ async function main() {
   // 不用 isDirectedAtAi 那套「你……吗」的启发式——群友之间互相提问也会命中，热闹的群里闸门又会被拦死。
   // 收尾后被提问照样会按唤醒条件叫醒她，这里宽一点不会漏回。
   function isDirectedAtSelfV2(event, kind, plainContent, quoteTargetIsSelf) {
-    if (kind === 'private') return true;
-    if (quoteTargetIsSelf) return true;
-    if (Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''))) return true;
+    return !!directedKindV2(event, kind, plainContent, quoteTargetIsSelf);
+  }
+  // 怎么叫的她：'private' | 'atMention'（@她或引用她）| 'nameMention'（叫她名字）| null。
+  function directedKindV2(event, kind, plainContent, quoteTargetIsSelf) {
+    if (kind === 'private') return 'private';
+    if (quoteTargetIsSelf) return 'atMention';
+    if (Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''))) return 'atMention';
+    return mentionsSelfNameV2(event, plainContent) ? 'nameMention' : null;
+  }
+  // 名字：QQ 昵称（Telegram 用 bot 的 first_name）加 socialV2.selfNames。
+  // 纯表情/符号的昵称（本机是 🐳）不拿来认人：群友发个 🐳 不代表在叫她。
+  function mentionsSelfNameV2(event, plainContent) {
     const nick = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
-    // 纯表情/符号的昵称（本机是 🐳）不拿来认人：群友发个 🐳 不代表在叫她。
     const names = [...(/\p{L}/u.test(nick || '') ? [nick] : []), ...selfNamesV2()];
     const lower = String(plainContent ?? '').toLowerCase();
     return names.some((name) => lower.includes(name.toLowerCase()));
@@ -10932,7 +10959,15 @@ async function main() {
     return Array.isArray(list) ? list.map((n) => String(n ?? '').trim()).filter(Boolean) : [];
   }
 
+  // 原因决定限频类别（wakeClassV2）：只要会唤醒、而这条消息确实在叫她，就报成 atMention / nameMention，
+  // 不让 anyMessage、关键词（「小鲸鱼」也在关键词里）抢先把它报成「其他」类、受每小时上限。
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
+    const reason = evaluateWakeTriggerBaseV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+    if (!reason || reason === 'private') return reason;
+    return directedKindV2(event, kind, plainContent, quoteTargetIsSelf) || reason;
+  }
+
+  function evaluateWakeTriggerBaseV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
@@ -10940,14 +10975,10 @@ async function main() {
       const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
       if (atSelf || quoteTargetIsSelf) return 'atMention';
     }
-    // Telegram 会话按 bot 的名字认，QQ 会话按 QQ 昵称认
-    const nameForWake = event?.platform === 'telegram' ? String(tg.me?.first_name ?? '').trim() : selfNickname;
-    if (tr.nameMention && nameForWake) {
-      // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
-      // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
-      const lower = String(plainContent ?? '').toLowerCase();
-      if (lower.includes('@' + nameForWake.toLowerCase()) || lower.includes(nameForWake.toLowerCase())) return 'nameMention';
-    }
+    // Telegram 会话按 bot 的名字认，QQ 会话按 QQ 昵称认，另加 socialV2.selfNames；纯表情昵称不算。
+    // 用 plainContent（当前消息自己的文字）：textContent 含 `[引用 某人：原文]`，
+    // 引用一条恰好提到机器人昵称的旧消息不该算「叫了名字」（那是被动触发的付费回合）。
+    if (tr.nameMention && mentionsSelfNameV2(event, plainContent)) return 'nameMention';
     if (Array.isArray(tr.keywords) && tr.keywords.length) {
       const lower = String(plainContent ?? '').toLowerCase();
       for (const kw of tr.keywords) {
@@ -11347,18 +11378,13 @@ async function main() {
     //   · @/提问被丢弃则要等下一条消息才可能再唤醒。
     // 重试仍然遵守限频（等到窗口腾出位置），只是把「这一枪」补回来。
     const now = Date.now();
-    const wakeClass = wakeClassV2(reason);
-    const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
-    const maxPerHour = wakeClass === 'random'
-      ? Number(cfg.socialV2?.wake?.maxRandomWakePerHour ?? 12) || 0
-      : wakeClass === 'other' ? Number(cfg.socialV2?.wake?.maxWakePerHour) || 0 : 0;
-    const minuteTimes = (st.wakeTimes || []).filter((t) => now - t < 60000);
-    const hourTimes = wakeTimesInClassV2(st, wakeClass).filter((t) => now - t < 3600000);
-    const minuteFull = maxPerMinute > 0 && minuteTimes.length >= maxPerMinute;
-    const hourFull = maxPerHour > 0 && hourTimes.length >= maxPerHour;
+    const { wakeClass, minuteTimes, hourTimes, minuteFull, hourFull } = wakeRateStateV2(st, reason, now);
     if (minuteFull || hourFull) {
       if (wakeClass === 'random') {
         log(`[reserved2] 随机唤醒超出${hourFull ? '每小时' : '每分钟'}上限，本次放弃 ${key}（${reason}）`);
+        // 正常情况下 scheduleWakeV2 已经先查过额度、不会清掉定时器；这里兜底的是 8 秒合并窗口里
+        // 额度刚好变满的情况：scheduleWakeV2 已清掉有限潜水的定时器，sleepUntil 还在，重新挂上。
+        if (!st.sleepTimer && !st.wakeConfig?.infinite && st.wakeConfig?.sleepUntil) setupSleepTimerV2(key);
         return;
       }
       let retryAfterMs = 0;
@@ -11376,14 +11402,19 @@ async function main() {
       if (!st.rateLimitRetryTimer || wakePriorityV2(reason) > wakePriorityV2(st.rateLimitRetryReason)) {
         st.rateLimitRetryReason = reason;
       }
+      // 排过定时器类原因（到点唤醒等）就记下来：升级成消息类原因后，未读清空也不能跳过这次重试，
+      // 否则 sleepTimer 已清空、到点唤醒就丢了。
+      if (isTimerWakeReason(reason)) st.rateLimitRetryHasTimerReason = true;
       if (!st.rateLimitRetryTimer) {
         st.rateLimitRetryTimer = setTimeout(() => {
           st.rateLimitRetryTimer = null;
           const retryReason = st.rateLimitRetryReason || reason;
+          const hadTimerReason = !!st.rateLimitRetryHasTimerReason;
           st.rateLimitRetryReason = null;
+          st.rateLimitRetryHasTimerReason = false;
           // 消息类原因在重试前再确认一次：等待窗口里消息可能已被别的回合处理掉，
           // 没必要为一条已经处理过的消息再唤醒一次（定时器类原因与未读无关，不检查）。
-          if (!isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
+          if (!hadTimerReason && !isTimerWakeReason(retryReason) && !(Array.isArray(st.unread) && st.unread.length > 0)) {
             log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${retryReason}）`);
             return;
           }
@@ -11394,6 +11425,9 @@ async function main() {
       log(`[reserved2] 唤醒频率超限，${Math.round(waitMs / 1000)}s 后重试 ${key}（${st.rateLimitRetryReason}）`);
       return;
     }
+    // 真的唤醒了：排队中的限频重试就没用了（她醒着会自己看消息、重新定唤醒配置）。
+    // 不清的话，分类限频后点名类能绕过排着的「其他」类重试，过期的重试之后还会再叫醒她一次。
+    clearRateLimitRetryV2(st);
     // Only a real new wake resets observation; skipped/busy candidates must
     // preserve the current turn's progress through its required wait window.
     st.preSleepWaitSatisfiedAt = 0;
@@ -11547,6 +11581,29 @@ async function main() {
     proactiveCheck: 20
   };
 
+  function clearRateLimitRetryV2(st) {
+    if (st.rateLimitRetryTimer) clearTimeout(st.rateLimitRetryTimer);
+    st.rateLimitRetryTimer = null;
+    st.rateLimitRetryReason = null;
+    st.rateLimitRetryHasTimerReason = false;
+  }
+
+  // 这次唤醒按限频该不该放行（分类见 wakeClassV2，用法见 sendWakePromptV2）。
+  function wakeRateStateV2(st, reason, now = Date.now()) {
+    const wakeClass = wakeClassV2(reason);
+    const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
+    const maxPerHour = wakeClass === 'random'
+      ? Number(cfg.socialV2?.wake?.maxRandomWakePerHour ?? 12) || 0
+      : wakeClass === 'other' ? Number(cfg.socialV2?.wake?.maxWakePerHour) || 0 : 0;
+    const minuteTimes = (st.wakeTimes || []).filter((t) => now - t < 60000);
+    const hourTimes = wakeTimesInClassV2(st, wakeClass).filter((t) => now - t < 3600000);
+    return {
+      wakeClass, minuteTimes, hourTimes,
+      minuteFull: maxPerMinute > 0 && minuteTimes.length >= maxPerMinute,
+      hourFull: maxPerHour > 0 && hourTimes.length >= maxPerHour,
+    };
+  }
+
   // 唤醒限频的类别（见 sendWakePromptV2）。原因可能带子类型或 seq（keyword:小鲸鱼、probability@seq797），取基名。
   const DIRECTED_WAKE_REASONS = new Set(['private', 'atMention', 'nameMention', 'question']);
   function wakeClassV2(reason) {
@@ -11608,6 +11665,13 @@ async function main() {
         if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
       }
       log(`[reserved2] 会话繁忙，暂存唤醒原因 ${key}（${reason}@seq${seq}，原因=${busyReasonV2(key, st)}）`);
+      return;
+    }
+    // 超额的随机唤醒反正会被放弃：在这里就挡掉，别先清了潜水定时器和回复检查再放弃
+    // （那样到点唤醒永远不会来，没 @ 的回复她也不会回来看）。
+    const rate = wakeRateStateV2(st, reason);
+    if (rate.wakeClass === 'random' && (rate.minuteFull || rate.hourFull)) {
+      log(`[reserved2] 随机唤醒超出${rate.hourFull ? '每小时' : '每分钟'}上限，不安排 ${key}（${reason}）`);
       return;
     }
     cancelReplyCheckV2(key); // 真实唤醒已接管，取消普通回复检查，避免 30s 后再补一刀
@@ -11770,11 +11834,7 @@ async function main() {
       clearTimeout(st.proactiveTimer);
       st.proactiveTimer = null;
     }
-    if (st.rateLimitRetryTimer) {
-      clearTimeout(st.rateLimitRetryTimer);
-      st.rateLimitRetryTimer = null;
-    }
-    st.rateLimitRetryReason = null;
+    clearRateLimitRetryV2(st);
     if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
   }
 
